@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 
@@ -43,7 +43,8 @@ type SharedDataType =
   | 'settings'
   | 'wallpaper'
   | 'relationship'
-  | 'playback';
+  | 'playback'
+  | 'location';
 
 interface SharedRecord {
   id: number;
@@ -51,25 +52,58 @@ interface SharedRecord {
   item_id: string;
   payload: Record<string, unknown>;
   created_at: string;
+  updated_at: string;
+}
+
+interface SharedLocation {
+  latitude: number;
+  longitude: number;
+  accuracy: number;
+  updatedAt: number;
+  userId: string;
 }
 
 interface LeafletMap {
   remove: () => void;
   setView: (coordinates: number[], zoom: number) => LeafletMap;
+  fitBounds: (coordinates: [number[], number[]], options: { padding: [number, number]; maxZoom: number }) => LeafletMap;
+  getZoom: () => number;
+}
+
+interface LeafletMarker {
+  addTo: (map: LeafletMap) => LeafletMarker;
+  setLatLng: (coordinates: number[]) => LeafletMarker;
+  bindPopup: (content: string) => LeafletMarker;
+  remove: () => void;
 }
 
 interface LeafletRuntime {
-  map: (container: HTMLElement, options: { zoomControl: boolean; attributionControl: boolean }) => LeafletMap;
-  tileLayer: (url: string, options: { maxZoom: number }) => { addTo: (map: LeafletMap) => void };
+  map: (container: HTMLElement, options: {
+    zoomControl: boolean;
+    attributionControl: boolean;
+    scrollWheelZoom: boolean;
+  }) => LeafletMap;
+  tileLayer: (url: string, options: { maxZoom: number; attribution: string }) => { addTo: (map: LeafletMap) => void };
   divIcon: (options: {
     className: string;
     html: string;
     iconSize: [number, number];
     iconAnchor: [number, number];
   }) => unknown;
-  marker: (coordinates: number[], options: { icon: unknown }) => {
-    addTo: (map: LeafletMap) => { bindPopup: (content: string) => void };
-  };
+  marker: (coordinates: number[], options: { icon: unknown }) => LeafletMarker;
+}
+
+const LOCATION_MAX_AGE_MS = 2 * 60 * 1000;
+
+function isLocationFresh(location: SharedLocation | null, now: number) {
+  if (!location || now < location.updatedAt) return false;
+  return now - location.updatedAt < LOCATION_MAX_AGE_MS;
+}
+
+function decodeVapidPublicKey(value: string) {
+  const padded = `${value}${'='.repeat((4 - (value.length % 4)) % 4)}`;
+  const base64 = padded.replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(atob(base64), (character) => character.charCodeAt(0)).buffer;
 }
 
 export default function Home() {
@@ -117,6 +151,7 @@ export default function Home() {
   const [currentSong, setCurrentSong] = useState<Song | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isSyncedMusic, setIsSyncedMusic] = useState(true);
+  const [musicError, setMusicError] = useState('');
   const audioRef = useRef<HTMLAudioElement>(null);
   const musicInputRef = useRef<HTMLInputElement>(null);
 
@@ -132,12 +167,25 @@ export default function Home() {
   const [sharedBgImage, setSharedBgImage] = useState('');
   const selectedImageFileRef = useRef<File | null>(null);
   const signedUrlCacheRef = useRef(new Map<string, { url: string; expiresAt: number }>());
-  const [batteryLevel, setBatteryLevel] = useState(85);
-  const [distanceKm] = useState('10,240 km');
+  const [isSharingLocation, setIsSharingLocation] = useState(false);
+  const [ownLocation, setOwnLocation] = useState<SharedLocation | null>(null);
+  const [partnerLocation, setPartnerLocation] = useState<SharedLocation | null>(null);
+  const [locationError, setLocationError] = useState('');
+  const [locationNow, setLocationNow] = useState(0);
+  const [isPushEnabled, setIsPushEnabled] = useState(false);
+  const [pushError, setPushError] = useState('');
   const [partnerLocalTime, setPartnerLocalTime] = useState('');
+  const [isMapReady, setIsMapReady] = useState(false);
 
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const leafletMapRef = useRef<LeafletMap | null>(null);
+  const leafletMarkersRef = useRef<{ own: LeafletMarker | null; partner: LeafletMarker | null }>({
+    own: null,
+    partner: null,
+  });
+  const hasFittedLocationsRef = useRef(false);
+  const lastSavedLocationRef = useRef<{ latitude: number; longitude: number; savedAt: number } | null>(null);
+  const isSavingLocationRef = useRef(false);
 
   const reportSyncError = (action: string, error: unknown) => {
     console.error(`Failed to ${action}:`, error);
@@ -145,7 +193,49 @@ export default function Home() {
     alert(`Couldn't ${action}. ${message}`);
   };
 
-  const saveSharedRecord = async (type: SharedDataType, itemId: string, payload: Record<string, unknown>) => {
+  const startAudioPlayback = useCallback((song: Song) => {
+    const audio = audioRef.current;
+    if (!audio) {
+      setMusicError('The audio player is not ready. Please try again.');
+      return false;
+    }
+
+    if (audio.getAttribute('src') !== song.url) audio.src = song.url;
+    setMusicError('');
+    void audio.play().catch((error: unknown) => {
+      console.error('Unable to play selected audio:', error);
+      setIsPlaying(false);
+      setMusicError(error instanceof DOMException && error.name === 'NotAllowedError'
+        ? 'Chrome blocked playback. Tap Play to start the track on this device.'
+        : 'Could not play this audio file. Check the upload and your connection.');
+    });
+    return true;
+  }, []);
+
+  const distanceKm = (() => {
+    if (!ownLocation
+      || !partnerLocation
+      || !isLocationFresh(ownLocation, locationNow)
+      || !isLocationFresh(partnerLocation, locationNow)) {
+      return 'Waiting for both live locations';
+    }
+
+    const radians = (degrees: number) => (degrees * Math.PI) / 180;
+    const latitudeDifference = radians(partnerLocation.latitude - ownLocation.latitude);
+    const longitudeDifference = radians(partnerLocation.longitude - ownLocation.longitude);
+    const haversine = Math.sin(latitudeDifference / 2) ** 2
+      + Math.cos(radians(ownLocation.latitude))
+      * Math.cos(radians(partnerLocation.latitude))
+      * Math.sin(longitudeDifference / 2) ** 2;
+    const distance = 6371 * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+    return `${Math.round(distance).toLocaleString()} km`;
+  })();
+
+  const saveSharedRecord = useCallback(async (
+    type: SharedDataType,
+    itemId: string,
+    payload: Record<string, unknown>,
+  ) => {
     if (!myCoupleCode) throw new Error('Pair your account before saving shared data.');
 
     const { error } = await supabase.from('couple_app_data').upsert({
@@ -156,7 +246,7 @@ export default function Home() {
     }, { onConflict: 'couple_code,data_type,item_id' });
 
     if (error) throw error;
-  };
+  }, [myCoupleCode]);
 
   const deleteSharedRecord = async (type: SharedDataType, itemId: string) => {
     if (!myCoupleCode) throw new Error('Pair your account before deleting shared data.');
@@ -286,44 +376,21 @@ export default function Home() {
 
   useEffect(() => {
     if (!audioRef.current || !currentSong) return;
-    audioRef.current.src = currentSong.url;
+    if (audioRef.current.getAttribute('src') !== currentSong.url) {
+      audioRef.current.src = currentSong.url;
+    }
     if (isPlaying) {
-      audioRef.current.play().catch((error) => console.error('Unable to play selected audio:', error));
+      startAudioPlayback(currentSong);
     } else {
       audioRef.current.pause();
     }
-  }, [currentSong, isPlaying]);
-
-  useEffect(() => {
-    if (!isPaired) return;
-
-    type BatteryStatus = {
-      level: number;
-      addEventListener: (event: 'levelchange', listener: () => void) => void;
-      removeEventListener: (event: 'levelchange', listener: () => void) => void;
-    };
-    const getBattery = (navigator as Navigator & { getBattery?: () => Promise<BatteryStatus> }).getBattery;
-    if (!getBattery) return;
-
-    let battery: BatteryStatus | undefined;
-    const updateBatteryLevel = () => {
-      if (battery) setBatteryLevel(Math.round(battery.level * 100));
-    };
-
-    void getBattery.call(navigator).then((result) => {
-      battery = result;
-      updateBatteryLevel();
-      battery.addEventListener('levelchange', updateBatteryLevel);
-    }).catch((error: unknown) => {
-      console.error('Unable to read device battery level:', error);
-    });
-
-    return () => battery?.removeEventListener('levelchange', updateBatteryLevel);
-  }, [isPaired]);
+  }, [currentSong, isPlaying, startAudioPlayback]);
 
   useEffect(() => {
     if (activeTab !== 'location' || !mapContainerRef.current) return;
 
+    let isActive = true;
+    const leafletWindow = window as Window & { L?: LeafletRuntime };
     if (!document.getElementById('leaflet-css')) {
       const link = document.createElement('link');
       link.id = 'leaflet-css';
@@ -332,70 +399,197 @@ export default function Home() {
       document.head.appendChild(link);
     }
 
-    const leafletWindow = window as Window & { L?: LeafletRuntime };
-    const loadLeafletScript = () => {
-      if (leafletWindow.L) {
-        initStreetViewMap();
-      } else {
-        const script = document.createElement('script');
+    const initializeMap = () => {
+      if (!isActive || !mapContainerRef.current || !leafletWindow.L || leafletMapRef.current) return;
+      const map = leafletWindow.L.map(mapContainerRef.current, {
+        zoomControl: true,
+        attributionControl: true,
+        scrollWheelZoom: true,
+      }).setView([20, 0], 2);
+      leafletWindow.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
+      }).addTo(map);
+      leafletMapRef.current = map;
+      setIsMapReady(true);
+    };
+
+    if (leafletWindow.L) {
+      initializeMap();
+    } else {
+      let script = document.querySelector<HTMLScriptElement>('script[data-heartlink-leaflet]');
+      if (!script) {
+        script = document.createElement('script');
         script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-        script.onload = () => initStreetViewMap();
+        script.dataset.heartlinkLeaflet = 'true';
         document.body.appendChild(script);
       }
-    };
+      script.addEventListener('load', initializeMap);
+      script.addEventListener('error', () => {
+        if (isActive) setLocationError('The map could not load. Check your internet connection and try again.');
+      });
+      if (leafletWindow.L) initializeMap();
+    }
 
-    const initStreetViewMap = () => {
-      if (leafletMapRef.current) {
-        leafletMapRef.current.remove();
+    return () => {
+      isActive = false;
+      leafletMapRef.current?.remove();
+      leafletMapRef.current = null;
+      setIsMapReady(false);
+      leafletMarkersRef.current = { own: null, partner: null };
+      hasFittedLocationsRef.current = false;
+    };
+  }, [activeTab]);
+
+  useEffect(() => {
+    const map = leafletMapRef.current;
+    const L = (window as Window & { L?: LeafletRuntime }).L;
+    if (activeTab !== 'location' || !isMapReady || !map || !L) return;
+
+    const freshOwnLocation = isLocationFresh(ownLocation, locationNow)
+      ? ownLocation
+      : null;
+    const freshPartnerLocation = isLocationFresh(partnerLocation, locationNow)
+      ? partnerLocation
+      : null;
+    const createPinHtml = (label: string, color: string, subText: string) => `
+      <div style="display: flex; flex-direction: column; align-items: center; cursor: pointer;">
+        <span style="background: #101625; color: ${color}; font-size: 10px; font-weight: bold; padding: 2px 8px; border-radius: 12px; border: 1px solid ${color}; box-shadow: 0 4px 10px rgba(0,0,0,0.5); white-space: nowrap; margin-bottom: 2px;">
+          ${subText}
+        </span>
+        <div style="width: 42px; height: 42px; border-radius: 50%; background: ${color}; color: white; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px; border: 3px solid white; box-shadow: 0 4px 12px rgba(0,0,0,0.4);">
+          ${label}
+        </div>
+      </div>
+    `;
+    const updateMarker = (
+      kind: 'own' | 'partner',
+      location: SharedLocation | null,
+      label: string,
+      color: string,
+      subText: string,
+      popupLabel: string,
+    ) => {
+      const oldMarker = leafletMarkersRef.current[kind];
+      if (!location) {
+        oldMarker?.remove();
+        leafletMarkersRef.current[kind] = null;
+        return;
       }
 
-      const L = leafletWindow.L;
-      if (!L) return;
-      const phCoords = [14.1102, 121.1413];
-      const seCoords = [56.5517, 14.1384];
-
-      const map = L.map(mapContainerRef.current!, {
-        zoomControl: false,
-        attributionControl: false
-      }).setView([14.1102, 121.1413], 12);
-
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-      }).addTo(map);
-
-      const createPinHtml = (label: string, color: string, subText: string) => `
-        <div style="display: flex; flex-direction: column; align-items: center; cursor: pointer;">
-          <span style="background: #101625; color: ${color}; font-size: 10px; font-weight: bold; padding: 2px 8px; border-radius: 12px; border: 1px solid ${color}; box-shadow: 0 4px 10px rgba(0,0,0,0.5); white-space: nowrap; margin-bottom: 2px;">
-            ${subText}
-          </span>
-          <div style="width: 42px; height: 42px; border-radius: 50%; background: ${color}; color: white; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px; border: 3px solid white; box-shadow: 0 4px 12px rgba(0,0,0,0.4);">
-            ${label}
-          </div>
-        </div>
-      `;
-
-      const phIcon = L.divIcon({
-        className: 'custom-ph-pin',
-        html: createPinHtml('JAY', '#ec4899', `⚡ ${batteryLevel}% (You)`),
+      const icon = L.divIcon({
+        className: `custom-${kind}-pin`,
+        html: createPinHtml(label, color, subText),
         iconSize: [60, 70],
-        iconAnchor: [30, 35]
+        iconAnchor: [30, 35],
       });
-
-      const seIcon = L.divIcon({
-        className: 'custom-se-pin',
-        html: createPinHtml('GF', '#a855f7', `🕒 ${partnerLocalTime || 'Sweden'}`),
-        iconSize: [60, 70],
-        iconAnchor: [30, 35]
-      });
-
-      L.marker(phCoords, { icon: phIcon }).addTo(map).bindPopup("<b>Jay</b><br>Sto. Tomas, Batangas, Philippines");
-      L.marker(seCoords, { icon: seIcon }).addTo(map).bindPopup("<b>Partner</b><br>Sweden");
-
-      leafletMapRef.current = map;
+      const marker = oldMarker ?? L.marker([location.latitude, location.longitude], { icon }).addTo(map);
+      marker.setLatLng([location.latitude, location.longitude]);
+      marker.bindPopup(
+        `<b>${popupLabel}</b><br>Accuracy: ±${Math.round(location.accuracy)} m<br>Updated: ${new Date(location.updatedAt).toLocaleTimeString()}`,
+      );
+      leafletMarkersRef.current[kind] = marker;
     };
 
-    loadLeafletScript();
-  }, [activeTab, batteryLevel, partnerLocalTime]);
+    updateMarker(
+      'own',
+      freshOwnLocation,
+      'YOU',
+      '#ec4899',
+      `±${Math.round(freshOwnLocation?.accuracy ?? 0)} m (You)`,
+      'Your location',
+    );
+    updateMarker(
+      'partner',
+      freshPartnerLocation,
+      'GF',
+      '#a855f7',
+      freshPartnerLocation
+        ? `Updated ${new Date(freshPartnerLocation.updatedAt).toLocaleTimeString()}`
+        : 'Not sharing live location',
+      'Partner location',
+    );
+
+    if (freshOwnLocation && freshPartnerLocation && !hasFittedLocationsRef.current) {
+      map.fitBounds([
+        [freshOwnLocation.latitude, freshOwnLocation.longitude],
+        [freshPartnerLocation.latitude, freshPartnerLocation.longitude],
+      ], { padding: [32, 32], maxZoom: 5 });
+      hasFittedLocationsRef.current = true;
+    } else if (freshOwnLocation && !freshPartnerLocation && !hasFittedLocationsRef.current) {
+      map.setView([freshOwnLocation.latitude, freshOwnLocation.longitude], 15);
+      hasFittedLocationsRef.current = true;
+    } else if (freshPartnerLocation && !freshOwnLocation && !hasFittedLocationsRef.current) {
+      map.setView([freshPartnerLocation.latitude, freshPartnerLocation.longitude], 15);
+      hasFittedLocationsRef.current = true;
+    }
+  }, [activeTab, isMapReady, ownLocation, partnerLocation, locationNow]);
+
+  useEffect(() => {
+    if (!isSharingLocation || !isPaired || !session?.user?.id || !myCoupleCode) return;
+    const watchId = navigator.geolocation.watchPosition((position) => {
+      const { latitude, longitude, accuracy } = position.coords;
+      const now = Date.now();
+      const previous = lastSavedLocationRef.current;
+      const distanceMoved = previous
+        ? 6371000 * 2 * Math.asin(Math.sqrt(
+          Math.sin(((latitude - previous.latitude) * Math.PI) / 360) ** 2
+            + Math.cos((previous.latitude * Math.PI) / 180)
+            * Math.cos((latitude * Math.PI) / 180)
+            * Math.sin(((longitude - previous.longitude) * Math.PI) / 360) ** 2,
+        ))
+        : Number.POSITIVE_INFINITY;
+      const location: SharedLocation = {
+        latitude,
+        longitude,
+        accuracy,
+        updatedAt: now,
+        userId: session.user.id,
+      };
+
+      setOwnLocation(location);
+      setLocationNow(now);
+      if (isSavingLocationRef.current
+        || (previous && distanceMoved < 20 && now - previous.savedAt < 20_000)) return;
+
+      isSavingLocationRef.current = true;
+      void saveSharedRecord('location', session.user.id, {
+        latitude,
+        longitude,
+        accuracy,
+        user_id: session.user.id,
+      }).then(() => {
+        lastSavedLocationRef.current = { latitude, longitude, savedAt: now };
+      }).catch((error: unknown) => {
+        console.error('Unable to share current location:', error);
+        setLocationError('Could not sync your location. Check the database setup and your connection.');
+        setIsSharingLocation(false);
+      }).finally(() => {
+        isSavingLocationRef.current = false;
+      });
+    }, (error) => {
+      console.error('Unable to read current location:', error);
+      setLocationError(error.code === error.PERMISSION_DENIED
+        ? 'Location permission was denied. Allow location access in Chrome settings to share.'
+        : 'Could not get your location. Check GPS and try again.');
+      setIsSharingLocation(false);
+    }, {
+      enableHighAccuracy: true,
+      maximumAge: 5000,
+      timeout: 20_000,
+    });
+
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [isSharingLocation, isPaired, session?.user?.id, myCoupleCode, saveSharedRecord]);
+
+  useEffect(() => {
+    const initialUpdate = window.setTimeout(() => setLocationNow(Date.now()), 0);
+    const interval = setInterval(() => setLocationNow(Date.now()), 10_000);
+    return () => {
+      window.clearTimeout(initialUpdate);
+      clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     if (!isPaired || !myCoupleCode || !session?.user?.email) return;
@@ -411,7 +605,7 @@ export default function Home() {
       for (let offset = 0; ; offset += pageSize) {
         const { data, error } = await supabase
           .from('couple_app_data')
-          .select('id,data_type,item_id,payload,created_at')
+          .select('id,data_type,item_id,payload,created_at,updated_at')
           .eq('couple_code', myCoupleCode)
           .order('created_at', { ascending: true })
           .order('id', { ascending: true })
@@ -445,6 +639,28 @@ export default function Home() {
           .filter((record) => record.data_type === 'signal'
             && String(record.payload.sender_email ?? '').toLowerCase() !== currentEmail)
           .at(-1)?.payload;
+        const locations = records
+          .filter((record) => record.data_type === 'location')
+          .map((record): SharedLocation | null => {
+            const payload = record.payload;
+            const latitude = Number(payload.latitude);
+            const longitude = Number(payload.longitude);
+            const accuracy = Number(payload.accuracy);
+            const updatedAt = Date.parse(record.updated_at);
+            if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90
+              || !Number.isFinite(longitude) || longitude < -180 || longitude > 180
+              || !Number.isFinite(updatedAt)) return null;
+            return {
+              latitude,
+              longitude,
+              accuracy: Number.isFinite(accuracy) ? accuracy : 0,
+              updatedAt,
+              userId: String(payload.user_id ?? ''),
+            };
+          })
+          .filter((location): location is SharedLocation => location !== null);
+        const ownPosition = locations.find((location) => location.userId === session.user.id) ?? null;
+        const partnerPosition = locations.find((location) => location.userId !== session.user.id) ?? null;
 
         const storedPosts = await Promise.all(records
           .filter((record) => record.data_type === 'post')
@@ -476,6 +692,14 @@ export default function Home() {
           }));
 
         const settings = records.find((record) => record.data_type === 'settings')?.payload;
+        const musicSyncPreferenceKey = `heartlink:music-sync:${session.user.id}`;
+        const localMusicSyncPreference = window.localStorage.getItem(musicSyncPreferenceKey);
+        if (localMusicSyncPreference === 'true' || localMusicSyncPreference === 'false') {
+          setIsSyncedMusic(localMusicSyncPreference === 'true');
+        } else if (typeof settings?.isSyncedMusic === 'boolean') {
+          setIsSyncedMusic(settings.isSyncedMusic);
+          window.localStorage.setItem(musicSyncPreferenceKey, String(settings.isSyncedMusic));
+        }
         const schedules = records
           .filter((record) => record.data_type === 'schedule')
           .map((record) => ({
@@ -494,18 +718,26 @@ export default function Home() {
         if (!isActive || loadId !== latestLoad) return;
         setMessages(storedMessages);
         setLastReceived(typeof lastSignal?.text === 'string' ? lastSignal.text : '');
+        setOwnLocation(ownPosition);
+        setPartnerLocation(partnerPosition);
         setPosts(storedPosts.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)));
         setPlaylist(storedSongs);
         if (settings?.tapMeanings && typeof settings.tapMeanings === 'object') {
           setTapMeanings(settings.tapMeanings as typeof tapMeanings);
           setTempMeanings(settings.tapMeanings as typeof tapMeanings);
         }
-        if (typeof settings?.isSyncedMusic === 'boolean') setIsSyncedMusic(settings.isSyncedMusic);
         setSchedules(schedules);
         setSharedBgImage(wallpaperUrl);
         if (typeof relationship?.startDate === 'string') setRelationshipStartDate(relationship.startDate);
-        setCurrentSong(playingSong);
-        setIsPlaying(Boolean(playback?.isPlaying) && settings?.isSyncedMusic !== false);
+        const followsPlayback = playback?.user_id
+          ? playback.user_id !== session.user.id
+          : settings?.isSyncedMusic !== false;
+        if (followsPlayback) {
+          setCurrentSong(playingSong);
+          setIsPlaying(Boolean(playback?.isPlaying));
+        } else {
+          setCurrentSong((current) => current ?? playingSong);
+        }
       } catch (error) {
         if (isActive) reportSyncError('load shared media and settings', error);
       }
@@ -544,7 +776,159 @@ export default function Home() {
       isActive = false;
       void supabase.removeChannel(channel);
     };
-  }, [isPaired, myCoupleCode, session?.user?.email]);
+  }, [isPaired, myCoupleCode, session?.user?.email, session?.user?.id]);
+
+  useEffect(() => {
+    if (!isPaired || !session || !('serviceWorker' in navigator) || !('PushManager' in window)) return;
+
+    let isActive = true;
+    void navigator.serviceWorker.ready.then((registration) => registration.pushManager.getSubscription())
+      .then((subscription) => {
+        if (isActive) setIsPushEnabled(Boolean(subscription));
+      })
+      .catch((error: unknown) => {
+        console.error('Unable to check push notification status:', error);
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [isPaired, session]);
+
+  const enablePushNotifications = async () => {
+    setPushError('');
+    if (!isPaired || !session) {
+      setPushError('Pair your account before enabling notifications.');
+      return;
+    }
+    if (!('Notification' in window) || !('PushManager' in window) || !('serviceWorker' in navigator)) {
+      setPushError('This browser does not support web push notifications.');
+      return;
+    }
+
+    const publicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
+    if (!publicKey) {
+      setPushError('Push notifications are not configured. Add the VAPID keys to your Vercel environment variables.');
+      return;
+    }
+
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') {
+        setPushError(permission === 'denied'
+          ? 'Notifications are blocked. Allow them in Chrome site settings, then try again.'
+          : 'Notification permission was not granted.');
+        return;
+      }
+
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: decodeVapidPublicKey(publicKey),
+      });
+      const response = await fetch('/api/push/subscribe', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(subscription),
+      });
+      if (!response.ok) {
+        const result = await response.json() as { error?: string };
+        await subscription.unsubscribe();
+        throw new Error(result.error ?? 'Could not save the push subscription.');
+      }
+
+      setIsPushEnabled(true);
+    } catch (error) {
+      console.error('Unable to enable partner notifications:', error);
+      setPushError(error instanceof Error ? error.message : 'Could not enable notifications.');
+    }
+  };
+
+  const disablePushNotifications = async () => {
+    if (!session || !('serviceWorker' in navigator)) return;
+    setPushError('');
+
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      if (!subscription) {
+        setIsPushEnabled(false);
+        return;
+      }
+
+      const response = await fetch('/api/push/subscribe', {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ endpoint: subscription.endpoint }),
+      });
+      if (!response.ok) {
+        const result = await response.json() as { error?: string };
+        throw new Error(result.error ?? 'Could not remove the push subscription.');
+      }
+
+      const unsubscribed = await subscription.unsubscribe();
+      if (!unsubscribed) throw new Error('Chrome did not remove the push subscription.');
+      setIsPushEnabled(false);
+    } catch (error) {
+      console.error('Unable to disable partner notifications:', error);
+      setPushError(error instanceof Error ? error.message : 'Could not disable notifications.');
+    }
+  };
+
+  const notifyPartner = async (kind: 'message' | 'signal', text: string) => {
+    if (!session) return;
+    try {
+      const response = await fetch('/api/push/notify', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ kind, text }),
+      });
+      const result = await response.json() as { sent?: number; reason?: string; error?: string };
+      if (!response.ok) throw new Error(result.error ?? 'The push service could not accept the notification.');
+      if (!result.sent) {
+        const reason = result.reason ?? 'No active push subscription was found.';
+        setPushError(reason);
+        alert(`Your ${kind === 'message' ? 'message' : 'tap'} was saved, but no push notification was sent: ${reason}`);
+      }
+    } catch (error) {
+      console.error('Unable to notify your partner:', error);
+      const message = error instanceof Error ? error.message : 'Push notification failed.';
+      setPushError(message);
+      alert(`Your ${kind === 'message' ? 'message' : 'tap'} was saved, but the notification failed: ${message}`);
+    }
+  };
+
+  const toggleLocationSharing = async () => {
+    if (isSharingLocation) {
+      setIsSharingLocation(false);
+      setOwnLocation(null);
+      lastSavedLocationRef.current = null;
+      if (session?.user?.id) {
+        try {
+          await deleteSharedRecord('location', session.user.id);
+        } catch (error) {
+          reportSyncError('remove your shared location', error);
+        }
+      }
+      return;
+    }
+
+    if (!navigator.geolocation) {
+      setLocationError('This browser does not support location sharing.');
+      return;
+    }
+    setLocationError('');
+    setIsSharingLocation(true);
+  };
 
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -625,6 +1009,7 @@ export default function Home() {
       setMessages((prev) => prev.some((item) => item.id === id)
         ? prev
         : [...prev, { id, sender: 'You', text: message, timestamp }]);
+      void notifyPartner('signal', message);
     } catch (error) {
       reportSyncError('save your tap signal', error);
     }
@@ -647,6 +1032,7 @@ export default function Home() {
         ? prev
         : [...prev, { id, sender: 'You', text, timestamp }]);
       setInputMessage('');
+      void notifyPartner('message', text);
     } catch (error) {
       reportSyncError('save your message', error);
     }
@@ -790,43 +1176,76 @@ export default function Home() {
     }
   };
 
-  const playSong = async (song: Song) => {
-    try {
-      await saveSharedRecord('playback', 'current', { songId: song.id, isPlaying: true });
-      setCurrentSong(song);
-      setIsPlaying(true);
-    } catch (error) {
-      reportSyncError('save music playback progress', error);
+  const playSong = (song: Song) => {
+    const playbackStarted = startAudioPlayback(song);
+    setCurrentSong(song);
+    setIsPlaying(playbackStarted);
+    if (isSyncedMusic) {
+      void saveSharedRecord('playback', 'current', {
+        songId: song.id,
+        isPlaying: playbackStarted,
+        user_id: session?.user?.id,
+      }).catch((error: unknown) => {
+        reportSyncError('save music playback progress', error);
+      });
     }
   };
 
-  const togglePlayPause = async () => {
+  const togglePlayPause = () => {
     if (!currentSong && playlist.length > 0) {
       playSong(playlist[0]);
       return;
     }
+    if (!currentSong) return;
+
     const newPlayingState = !isPlaying;
-    try {
-      await saveSharedRecord('playback', 'current', {
-        songId: currentSong?.id ?? null,
+    if (newPlayingState) {
+      if (!startAudioPlayback(currentSong)) return;
+    } else {
+      audioRef.current?.pause();
+    }
+    setIsPlaying(newPlayingState);
+
+    if (isSyncedMusic) {
+      void saveSharedRecord('playback', 'current', {
+        songId: currentSong.id,
         isPlaying: newPlayingState,
+        user_id: session?.user?.id,
+      }).catch((error: unknown) => {
+        reportSyncError('save music playback progress', error);
       });
-      setIsPlaying(newPlayingState);
-    } catch (error) {
-      reportSyncError('save music playback progress', error);
     }
   };
 
   const toggleMusicSync = async () => {
     const nextValue = !isSyncedMusic;
     try {
-      await saveSharedRecord('settings', 'current', {
-        tapMeanings,
-        isSyncedMusic: nextValue,
-      });
+      if (currentSong && (nextValue || isPlaying)) {
+        await saveSharedRecord('playback', 'current', {
+          songId: currentSong.id,
+          isPlaying: nextValue && isPlaying,
+          user_id: session?.user?.id,
+        });
+      }
+      if (session?.user?.id) {
+        window.localStorage.setItem(`heartlink:music-sync:${session.user.id}`, String(nextValue));
+      }
       setIsSyncedMusic(nextValue);
     } catch (error) {
       reportSyncError('save music sync settings', error);
+    }
+  };
+
+  const handleSongEnded = () => {
+    setIsPlaying(false);
+    if (isSyncedMusic && currentSong) {
+      void saveSharedRecord('playback', 'current', {
+        songId: currentSong.id,
+        isPlaying: false,
+        user_id: session?.user?.id,
+      }).catch((error: unknown) => {
+        console.error('Unable to sync the end of the song:', error);
+      });
     }
   };
 
@@ -872,7 +1291,6 @@ export default function Home() {
     try {
       await saveSharedRecord('settings', 'current', {
         tapMeanings: tempMeanings,
-        isSyncedMusic,
       });
       setTapMeanings(tempMeanings);
       setShowSettings(false);
@@ -982,7 +1400,7 @@ export default function Home() {
     >
       {sharedBgImage && <div className="absolute inset-0 bg-[#080c14]/80 pointer-events-none z-0"></div>}
 
-      <audio ref={audioRef} onEnded={() => setIsPlaying(false)} />
+      <audio ref={audioRef} onEnded={handleSongEnded} />
 
       {/* 1. FIXED TOP HEADER BAR */}
       <div className="w-full bg-[#101625]/90 backdrop-blur-md border-b border-slate-800 px-5 py-3.5 flex justify-between items-center shadow-md z-20 shrink-0 h-14">
@@ -1186,11 +1604,42 @@ export default function Home() {
               </div>
             </div>
 
+            <div className="shrink-0 rounded-2xl border border-slate-800 bg-[#101625]/90 p-3 space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold text-white">Share precise location</p>
+                  <p className="text-[10px] text-slate-400">
+                    {isSharingLocation
+                      ? 'Sharing while Heartlink stays open'
+                      : 'Off by default. Your paired partner can see it while it is fresh.'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void toggleLocationSharing()}
+                  disabled={!isPaired}
+                  aria-pressed={isSharingLocation}
+                  className={`shrink-0 rounded-xl border px-3 py-2 text-[10px] font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                    isSharingLocation
+                      ? 'border-rose-500/40 bg-rose-500/15 text-rose-300'
+                      : 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                  }`}
+                >
+                  {isSharingLocation ? 'Stop sharing' : 'Share location'}
+                </button>
+              </div>
+              {!isPaired && <p className="text-[10px] text-amber-300">Pair your account first.</p>}
+              {locationError && <p role="alert" className="text-[10px] text-rose-300">{locationError}</p>}
+              <p className="text-[10px] text-slate-500">
+                Exact GPS is visible only to your paired account. PWA sharing pauses when Chrome suspends or closes Heartlink; old locations are hidden after 2 minutes.
+              </p>
+            </div>
+
             <div className="relative w-full flex-1 min-h-[320px] border border-slate-800 rounded-2xl overflow-hidden shadow-2xl z-0">
               <div ref={mapContainerRef} className="w-full h-full min-h-[320px]"></div>
               
               <p className="absolute bottom-2 left-2 z-[400] text-[9px] text-slate-700 font-semibold bg-white/90 px-2.5 py-1 rounded-full border border-slate-300 shadow">
-                Life360 Street Map View
+                OpenStreetMap · Last update expires after 2 min
               </p>
             </div>
           </div>
@@ -1202,7 +1651,11 @@ export default function Home() {
             <div className="flex justify-between items-center bg-[#101625]/90 border border-slate-800 px-4 py-2.5 rounded-2xl shrink-0">
               <div>
                 <p className="text-xs font-bold text-pink-400">🎵 Music Sync Room</p>
-                <p className="text-[10px] text-slate-400">Shared couple radio station</p>
+                <p className="text-[10px] text-slate-400">
+                  {isSyncedMusic
+                    ? 'Your music is shared with your partner'
+                    : 'Your music stays on this device'}
+                </p>
               </div>
               <button
                 onClick={toggleMusicSync}
@@ -1213,6 +1666,11 @@ export default function Home() {
                 Sync: {isSyncedMusic ? 'ON 🟢' : 'OFF ⚪'}
               </button>
             </div>
+            <p className="text-[10px] text-slate-500 shrink-0">
+              {isSyncedMusic
+                ? 'Browser autoplay rules may require your partner to tap Play on their device.'
+                : 'Turning Sync off pauses shared playback for your partner; your local playback continues.'}
+            </p>
 
             <div className="space-y-2 flex-1 overflow-y-auto pr-1">
               {playlist.length === 0 ? (
@@ -1258,6 +1716,7 @@ export default function Home() {
                   </button>
                 </div>
               )}
+              {musicError && <p role="alert" className="text-[10px] text-rose-300">{musicError}</p>}
 
               <div className="flex justify-between items-center pt-1">
                 <span className="text-[11px] font-semibold text-slate-300">Add Audio File (MP3)</span>
@@ -1372,6 +1831,33 @@ export default function Home() {
                   <input type="file" accept="image/*" onChange={handleWallpaperUpload} className="hidden" />
                 </label>
               </div>
+            </div>
+
+            <div className="bg-[#080c14] border border-slate-800 p-4 rounded-2xl space-y-2">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs font-bold text-pink-400">🔔 Partner notifications</p>
+                  <p className="text-[10px] text-slate-400">
+                    {isPushEnabled ? 'This device can receive push alerts.' : 'Allow messages and tap alerts on this device.'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void (isPushEnabled ? disablePushNotifications() : enablePushNotifications())}
+                  disabled={!isPaired}
+                  className={`shrink-0 rounded-xl px-3 py-2 text-[10px] font-bold transition disabled:opacity-50 ${
+                    isPushEnabled
+                      ? 'bg-slate-800 text-slate-300'
+                      : 'bg-pink-600 text-white hover:bg-pink-500'
+                  }`}
+                >
+                  {isPushEnabled ? 'Disable' : 'Enable'}
+                </button>
+              </div>
+              {pushError && <p role="alert" className="text-[10px] text-rose-300">{pushError}</p>}
+              <p className="text-[10px] text-slate-500">
+                Each partner must enable notifications on their own device. Delivery requires internet and browser notification permission.
+              </p>
             </div>
 
             <div className="bg-[#080c14] border border-slate-800 p-4 rounded-2xl space-y-3">

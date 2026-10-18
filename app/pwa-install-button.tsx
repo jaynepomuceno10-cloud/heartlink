@@ -23,6 +23,7 @@ const getStandaloneMode = () => window.matchMedia("(display-mode: standalone)").
 
 export default function PwaInstallButton() {
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
+  const [installStatus, setInstallStatus] = useState<"idle" | "installing" | "installed">("idle");
   const isInstalled = useSyncExternalStore(subscribeToStandaloneMode, getStandaloneMode, () => false);
 
   useEffect(() => {
@@ -38,6 +39,7 @@ export default function PwaInstallButton() {
     };
     const handleAppInstalled = () => {
       setInstallPrompt(null);
+      setInstallStatus("installed");
     };
 
     window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
@@ -58,22 +60,44 @@ export default function PwaInstallButton() {
 
     try {
       await installPrompt.prompt();
-      await installPrompt.userChoice;
+      const { outcome } = await installPrompt.userChoice;
       setInstallPrompt(null);
+      if (outcome === "accepted") {
+        setInstallStatus("installing");
+      }
     } catch (error) {
       console.error("Unable to start the Heartlink install prompt:", error);
+      setInstallStatus("idle");
       alert("Heartlink could not open the install prompt. Try Chrome’s ⋮ menu and choose “Install app”.");
     }
   };
 
   return (
-    <button
-      type="button"
-      onClick={installApp}
-      className="fixed bottom-20 right-4 z-40 rounded-full border border-pink-400/40 bg-[#101625]/95 px-4 py-2.5 text-xs font-bold text-pink-300 shadow-xl backdrop-blur-md transition hover:bg-pink-500/20 focus:outline-none focus:ring-2 focus:ring-pink-400"
-      aria-label="Install Heartlink on this device"
+    <div
+      className="fixed bottom-20 right-4 z-40 flex max-w-[calc(100vw-2rem)] flex-col items-end gap-2"
+      aria-live="polite"
     >
-      Install Heartlink
-    </button>
+      {installStatus === "installed" && (
+        <p className="max-w-64 rounded-xl border border-emerald-500/40 bg-[#101625]/95 px-3 py-2 text-right text-xs text-slate-200 shadow-xl">
+          Heartlink is installed. Open your Apps screen, then long-press Heartlink to add it to your Home screen.
+        </p>
+      )}
+      {installStatus === "installing" && (
+        <p className="max-w-64 rounded-xl border border-slate-700 bg-[#101625]/95 px-3 py-2 text-right text-xs text-slate-200 shadow-xl">
+          Chrome accepted the install request. Complete any Android confirmation, then look for Heartlink in your Apps screen.
+        </p>
+      )}
+      {installStatus !== "installed" && (
+        <button
+          type="button"
+          onClick={installApp}
+          disabled={installStatus === "installing"}
+          className="rounded-full border border-pink-400/40 bg-[#101625]/95 px-4 py-2.5 text-xs font-bold text-pink-300 shadow-xl backdrop-blur-md transition hover:bg-pink-500/20 focus:outline-none focus:ring-2 focus:ring-pink-400 disabled:cursor-wait disabled:opacity-70"
+          aria-label="Install Heartlink on this device"
+        >
+          {installStatus === "installing" ? "Installing Heartlink…" : "Install Heartlink"}
+        </button>
+      )}
+    </div>
   );
 }
