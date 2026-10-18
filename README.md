@@ -25,6 +25,9 @@ It enables opt-in, couple-only location sharing and creates the private push-sub
 table. Location sharing uses high-accuracy browser geolocation only while Heartlink is open
 and the user has enabled sharing. Android may pause it when the PWA is backgrounded or
 closed; locations older than two minutes are hidden from the partner.
+The live data subscription retries with capped exponential backoff after connection errors,
+reconnects promptly when the device comes back online, and shows its status without blocking
+the app with browser alerts.
 
 Push notifications are sent through the Next.js API and require these environment variables
 in local development and Vercel Production:

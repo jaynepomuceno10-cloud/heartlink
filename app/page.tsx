@@ -115,6 +115,8 @@ export default function Home() {
   const [coupleCodeInput, setCoupleCodeInput] = useState('');
   const [myCoupleCode, setMyCoupleCode] = useState('');
   const [isPaired, setIsPaired] = useState(false);
+  const [realtimeStatus, setRealtimeStatus] = useState<'connecting' | 'connected' | 'reconnecting' | 'offline'>('connecting');
+  const [sharedDataWarning, setSharedDataWarning] = useState('');
   const [pairingAction, setPairingAction] = useState<'enter' | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -596,7 +598,25 @@ export default function Home() {
 
     let isActive = true;
     let latestLoad = 0;
+    let loadRetryCount = 0;
+    let loadRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectRetryCount = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let isReconnecting = false;
+    let isRealtimeConnected = false;
+    let channel: ReturnType<typeof supabase.channel> | null = null;
     const currentEmail = session.user.email.toLowerCase();
+
+    const scheduleDataReload = () => {
+      if (!isActive || loadRetryTimer) return;
+      const delay = Math.min(1000 * 2 ** loadRetryCount, 30_000);
+      loadRetryCount += 1;
+      setSharedDataWarning('Shared data could not refresh. Retrying automatically...');
+      loadRetryTimer = setTimeout(() => {
+        loadRetryTimer = null;
+        void loadSharedData();
+      }, delay);
+    };
 
     const loadSharedData = async () => {
       const loadId = ++latestLoad;
@@ -613,7 +633,10 @@ export default function Home() {
           .returns<SharedRecord[]>();
 
         if (error) {
-          if (isActive) reportSyncError('load shared data (run supabase-sync.sql in Supabase SQL Editor first)', error);
+          if (isActive) {
+            console.error('Unable to refresh shared Heartlink data:', error);
+            scheduleDataReload();
+          }
           return;
         }
         records.push(...(data ?? []));
@@ -716,6 +739,8 @@ export default function Home() {
         const playingSong = storedSongs.find((song) => song.id === playback?.songId) ?? null;
 
         if (!isActive || loadId !== latestLoad) return;
+        loadRetryCount = 0;
+        setSharedDataWarning('');
         setMessages(storedMessages);
         setLastReceived(typeof lastSignal?.text === 'string' ? lastSignal.text : '');
         setOwnLocation(ownPosition);
@@ -739,42 +764,119 @@ export default function Home() {
           setCurrentSong((current) => current ?? playingSong);
         }
       } catch (error) {
-        if (isActive) reportSyncError('load shared media and settings', error);
+        if (isActive) {
+          console.error('Unable to refresh shared Heartlink media and settings:', error);
+          scheduleDataReload();
+        }
+      }
+    };
+
+    const scheduleReconnect = (status: string) => {
+      if (!isActive) return;
+      isRealtimeConnected = false;
+      setRealtimeStatus(navigator.onLine ? 'reconnecting' : 'offline');
+      console.warn(`Supabase Realtime subscription status: ${status}`);
+      if (!navigator.onLine || reconnectTimer) return;
+
+      const baseDelay = Math.min(1000 * 2 ** reconnectRetryCount, 30_000);
+      const delay = Math.round(baseDelay * (0.8 + Math.random() * 0.4));
+      reconnectRetryCount += 1;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        void reconnectChannel();
+      }, delay);
+    };
+
+    const subscribeToSharedData = () => {
+      if (!isActive) return;
+      setRealtimeStatus(navigator.onLine ? 'connecting' : 'offline');
+      const nextChannel = supabase
+        .channel(`shared-data-${myCoupleCode}`)
+        .on('postgres_changes', {
+          event: '*',
+          schema: 'public',
+          table: 'couple_app_data',
+          filter: `couple_code=eq.${myCoupleCode}`,
+        }, (payload) => {
+          const changedRecord = payload.new as SharedRecord | undefined;
+          if (changedRecord?.data_type === 'signal') {
+            const senderEmail = String(changedRecord.payload.sender_email ?? '').toLowerCase();
+            if (senderEmail !== currentEmail) {
+              setLastReceived(String(changedRecord.payload.text ?? ''));
+              triggerHapticPattern(String(changedRecord.payload.hapticType ?? ''));
+            }
+          } else if (changedRecord?.data_type === 'chat') {
+            const senderEmail = String(changedRecord.payload.sender_email ?? '').toLowerCase();
+            if (senderEmail !== currentEmail && 'vibrate' in navigator) navigator.vibrate(100);
+          }
+          void loadSharedData();
+        })
+        .subscribe((status) => {
+          if (!isActive || channel !== nextChannel) return;
+          if (status === 'SUBSCRIBED') {
+            isRealtimeConnected = true;
+            reconnectRetryCount = 0;
+            setRealtimeStatus('connected');
+            void loadSharedData();
+          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+            scheduleReconnect(status);
+          }
+        });
+      channel = nextChannel;
+    };
+
+    const reconnectChannel = async () => {
+      if (!isActive || isReconnecting || isRealtimeConnected) return;
+      isReconnecting = true;
+      const previousChannel = channel;
+      channel = null;
+      try {
+        if (previousChannel) await supabase.removeChannel(previousChannel);
+        if (isActive) subscribeToSharedData();
+      } catch (error) {
+        console.error('Unable to restart the Supabase Realtime subscription:', error);
+        scheduleReconnect('RECONNECT_FAILED');
+      } finally {
+        isReconnecting = false;
+      }
+    };
+
+    const handleOnline = () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (!isRealtimeConnected) void reconnectChannel();
+      if (loadRetryTimer) {
+        clearTimeout(loadRetryTimer);
+        loadRetryTimer = null;
+        void loadSharedData();
+      }
+    };
+    const handleOffline = () => {
+      isRealtimeConnected = false;
+      setRealtimeStatus('offline');
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && !isRealtimeConnected) {
+        void reconnectChannel();
       }
     };
 
     void loadSharedData();
-
-    const channel = supabase
-      .channel(`shared-data-${myCoupleCode}`)
-      .on('postgres_changes', {
-        event: '*',
-        schema: 'public',
-        table: 'couple_app_data',
-        filter: `couple_code=eq.${myCoupleCode}`,
-      }, (payload) => {
-        const changedRecord = payload.new as SharedRecord | undefined;
-        if (changedRecord?.data_type === 'signal') {
-          const senderEmail = String(changedRecord.payload.sender_email ?? '').toLowerCase();
-          if (senderEmail !== currentEmail) {
-            setLastReceived(String(changedRecord.payload.text ?? ''));
-            triggerHapticPattern(String(changedRecord.payload.hapticType ?? ''));
-          }
-        } else if (changedRecord?.data_type === 'chat') {
-          const senderEmail = String(changedRecord.payload.sender_email ?? '').toLowerCase();
-          if (senderEmail !== currentEmail && 'vibrate' in navigator) navigator.vibrate(100);
-        }
-        void loadSharedData();
-      })
-      .subscribe((status) => {
-        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-          reportSyncError('connect live data sync', new Error(`Supabase Realtime status: ${status}`));
-        }
-      });
+    subscribeToSharedData();
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       isActive = false;
-      void supabase.removeChannel(channel);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (loadRetryTimer) clearTimeout(loadRetryTimer);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (channel) void supabase.removeChannel(channel);
     };
   }, [isPaired, myCoupleCode, session?.user?.email, session?.user?.id]);
 
@@ -1407,10 +1509,24 @@ export default function Home() {
         <h1 className="font-extrabold text-xl tracking-widest text-transparent bg-clip-text bg-gradient-to-r from-rose-500 to-pink-400">HEARTLINK</h1>
         <div className="flex items-center gap-3">
           <span className={`px-3 py-1 rounded-full text-[11px] font-semibold flex items-center gap-1.5 border ${
-            isPaired ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/15 border-amber-500/30 text-amber-400'
+            !isPaired
+              ? 'bg-amber-500/15 border-amber-500/30 text-amber-400'
+              : realtimeStatus === 'connected'
+                ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400'
+                : realtimeStatus === 'offline'
+                  ? 'bg-rose-500/15 border-rose-500/30 text-rose-300'
+                  : 'bg-amber-500/15 border-amber-500/30 text-amber-300'
           }`}>
-            <span className={`w-2 h-2 rounded-full animate-pulse ${isPaired ? 'bg-emerald-500' : 'bg-amber-500'}`}></span> 
-            {isPaired ? 'Connected' : 'Unpaired'}
+            <span className={`w-2 h-2 rounded-full ${isPaired && realtimeStatus === 'connected' ? 'animate-pulse bg-emerald-400' : 'bg-current'}`}></span>
+            {!isPaired
+              ? 'Unpaired'
+              : realtimeStatus === 'connected'
+                ? 'Connected'
+                : realtimeStatus === 'offline'
+                  ? 'Offline'
+                  : realtimeStatus === 'reconnecting'
+                    ? 'Reconnecting'
+                    : 'Connecting'}
           </span>
           <button
             onClick={() => { setTempMeanings(tapMeanings); setShowSettings(true); }}
@@ -1424,6 +1540,11 @@ export default function Home() {
 
       {/* 2. FIXED MIDDLE VIEWPORT CONTAINER */}
       <div className="flex-1 w-full overflow-hidden relative flex flex-col z-10">
+        {isPaired && sharedDataWarning && (
+          <p role="status" aria-live="polite" className="absolute top-2 left-3 right-3 z-30 rounded-lg border border-amber-500/25 bg-[#101625]/95 px-3 py-2 text-center text-[10px] text-amber-200 shadow-lg">
+            {sharedDataWarning}
+          </p>
+        )}
         
         {/* TAB 1: TAPS */}
         {activeTab === 'taps' && (
