@@ -64,6 +64,17 @@ interface SharedLocation {
   timeZone?: string;
 }
 
+interface PushDiagnostics {
+  serverEnvironment: boolean;
+  missingVariables: string[];
+  vapidFormat: boolean;
+  vapidKeysMatch: boolean;
+  pairing: boolean;
+  subscriptionTable: boolean;
+  partnerSubscription: boolean;
+  partnerSubscriptionCount: number;
+}
+
 interface LeafletMap {
   remove: () => void;
   setView: (coordinates: number[], zoom: number) => LeafletMap;
@@ -208,8 +219,9 @@ export default function Home() {
   const [locationNow, setLocationNow] = useState(0);
   const [isPushEnabled, setIsPushEnabled] = useState(false);
   const [pushError, setPushError] = useState('');
+  const [pushDiagnostics, setPushDiagnostics] = useState<PushDiagnostics | null>(null);
+  const [isCheckingPush, setIsCheckingPush] = useState(false);
   const [partnerLocalTime, setPartnerLocalTime] = useState('');
-  const [notificationNotice, setNotificationNotice] = useState('');
   const [isMapReady, setIsMapReady] = useState(false);
 
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -988,7 +1000,7 @@ export default function Home() {
 
   const enablePushNotifications = async () => {
     setPushError('');
-    setNotificationNotice('');
+    setPushDiagnostics(null);
     if (!isPaired || !session) {
       setPushError('Pair your account before enabling notifications.');
       return;
@@ -1069,23 +1081,23 @@ export default function Home() {
 
       setIsPushEnabled(true);
       setPushError('');
-      setNotificationNotice('Notifications are enabled on this device.');
     } catch (error) {
       console.error('Unable to enable partner notifications:', error);
       setPushError(error instanceof Error ? error.message : 'Could not enable notifications.');
-      setNotificationNotice('Could not enable notifications. See the details in Settings.');
     }
   };
 
   const disablePushNotifications = async () => {
     if (!session || !('serviceWorker' in navigator)) return;
     setPushError('');
+    setPushDiagnostics(null);
 
     try {
       const registration = await navigator.serviceWorker.ready;
       const subscription = await registration.pushManager.getSubscription();
       if (!subscription) {
         setIsPushEnabled(false);
+        setPushError('');
         return;
       }
 
@@ -1111,17 +1123,44 @@ export default function Home() {
       const unsubscribed = await subscription.unsubscribe();
       if (!unsubscribed) throw new Error('Chrome did not remove the push subscription.');
       setIsPushEnabled(false);
-      setNotificationNotice('Notifications are disabled on this device.');
+      setPushError('');
     } catch (error) {
       console.error('Unable to disable partner notifications:', error);
       setPushError(error instanceof Error ? error.message : 'Could not disable notifications.');
-      setNotificationNotice('Could not disable notifications. See the details in Settings.');
+    }
+  };
+
+  const checkPushSetup = async () => {
+    if (!session) return;
+    setIsCheckingPush(true);
+    setPushError('');
+    try {
+      const response = await fetch('/api/push/diagnostics', {
+        method: 'POST',
+        headers: {
+          Authorization: `******`,
+          'Content-Type': 'application/json',
+        },
+      });
+      const result = await response.json() as {
+        checks?: PushDiagnostics;
+        error?: string;
+      };
+      if (!response.ok || !result.checks) {
+        throw new Error(result.error ?? 'Could not check notification setup.');
+      }
+      setPushDiagnostics(result.checks);
+      if (result.error) setPushError(result.error);
+    } catch (error) {
+      console.error('Unable to diagnose partner notifications:', error);
+      setPushError(error instanceof Error ? error.message : 'Could not check notification setup.');
+    } finally {
+      setIsCheckingPush(false);
     }
   };
 
   const notifyPartner = async (kind: 'message' | 'signal', text: string) => {
     if (!session) return;
-    setNotificationNotice('');
     try {
       const response = await fetch('/api/push/notify', {
         method: 'POST',
@@ -1141,7 +1180,6 @@ export default function Home() {
       if (!result.sent) {
         const reason = result.reason ?? 'No active push subscription was found.';
         setPushError(reason);
-        setNotificationNotice(`Your ${kind === 'message' ? 'message' : 'tap'} was saved, but no push notification was sent: ${reason}`);
       } else {
         setPushError('');
       }
@@ -1149,7 +1187,6 @@ export default function Home() {
       console.error('Unable to notify your partner:', error);
       const message = error instanceof Error ? error.message : 'Push notification failed.';
       setPushError(message);
-      setNotificationNotice(`Your ${kind === 'message' ? 'message' : 'tap'} was saved, but the notification failed: ${message}`);
     }
   };
 
@@ -1689,11 +1726,6 @@ export default function Home() {
             {sharedDataWarning}
           </p>
         )}
-        {notificationNotice && (
-          <p role="status" aria-live="polite" className="absolute top-14 left-3 right-3 z-30 rounded-lg border border-pink-500/25 bg-[#101625]/95 px-3 py-2 text-center text-[10px] text-pink-100 shadow-lg">
-            {notificationNotice}
-          </p>
-        )}
         
         {/* TAB 1: TAPS */}
         {activeTab === 'taps' && (
@@ -2124,6 +2156,47 @@ export default function Home() {
                   {isPushEnabled ? 'Disable' : 'Enable'}
                 </button>
               </div>
+              <button
+                type="button"
+                onClick={() => void checkPushSetup()}
+                disabled={!session || isCheckingPush}
+                className="rounded-lg border border-slate-700 px-3 py-1.5 text-[10px] font-semibold text-slate-300 transition hover:border-pink-500/50 hover:text-white disabled:opacity-50"
+              >
+                {isCheckingPush ? 'Checking setup...' : 'Check notification setup'}
+              </button>
+              {pushDiagnostics && (
+                <ul className="space-y-1 text-[10px]">
+                  <li className={pushDiagnostics.serverEnvironment ? 'text-emerald-300' : 'text-rose-300'}>
+                    {pushDiagnostics.serverEnvironment
+                      ? 'Server environment variables are present.'
+                      : `Missing Vercel variables: ${pushDiagnostics.missingVariables.join(', ') || 'Supabase server configuration'}.`}
+                  </li>
+                  <li className={pushDiagnostics.vapidFormat ? 'text-emerald-300' : 'text-rose-300'}>
+                    {pushDiagnostics.vapidFormat ? 'VAPID values have valid formats.' : 'VAPID values are missing or invalid.'}
+                  </li>
+                  <li className={pushDiagnostics.vapidKeysMatch ? 'text-emerald-300' : 'text-rose-300'}>
+                    {pushDiagnostics.vapidKeysMatch
+                      ? 'VAPID public and private keys match.'
+                      : pushDiagnostics.missingVariables.includes('NEXT_PUBLIC_VAPID_PUBLIC_KEY')
+                        || pushDiagnostics.missingVariables.includes('VAPID_PRIVATE_KEY')
+                        ? 'VAPID key pair could not be checked because a key is missing.'
+                        : 'VAPID public and private keys do not match.'}
+                  </li>
+                  <li className={pushDiagnostics.pairing ? 'text-emerald-300' : 'text-rose-300'}>
+                    {pushDiagnostics.pairing ? 'Couple pairing is available.' : 'This account is not paired.'}
+                  </li>
+                  <li className={pushDiagnostics.subscriptionTable ? 'text-emerald-300' : 'text-rose-300'}>
+                    {pushDiagnostics.subscriptionTable
+                      ? 'Supabase push-subscription table is available.'
+                      : 'Push-subscription table is unavailable; run supabase-ldr-features.sql after supabase-sync.sql.'}
+                  </li>
+                  <li className={pushDiagnostics.partnerSubscription ? 'text-emerald-300' : 'text-amber-300'}>
+                    {pushDiagnostics.partnerSubscription
+                      ? `Partner has ${pushDiagnostics.partnerSubscriptionCount} registered notification device(s).`
+                      : 'Partner has not enabled notifications on a device yet.'}
+                  </li>
+                </ul>
+              )}
               {pushError && <p role="alert" className="text-[10px] text-rose-300">{pushError}</p>}
               <p className="text-[10px] text-slate-500">
                 Each partner must enable notifications on their own device. Delivery requires internet and browser notification permission.

@@ -44,6 +44,10 @@ Generate a VAPID key pair with `npx web-push generate-vapid-keys`, then configur
 key, private key, and subject. The existing Supabase URL and anon key are also needed by the
 app. Each partner must sign in, pair, and enable notifications on each device in Heartlink
 Settings. Push delivery requires internet access and browser notification permission.
+Use **Settings → Check notification setup** to verify that the deployed server variables,
+VAPID format, Supabase push-subscription table, pairing, and the partner's registered devices
+are available. These variables belong in Vercel's project environment, not Supabase Edge
+Function settings; notification delivery uses the Next.js `/api/push` routes.
 If push setup or delivery fails, first run both SQL scripts in the order above, verify the
 VAPID and Supabase environment variables are set for the deployed Vercel environment, and
 redeploy. Then have the receiving partner open Heartlink, allow notifications, and enable
