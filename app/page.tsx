@@ -1,18 +1,21 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
+import type { Session } from '@supabase/supabase-js';
 import { supabase } from '../lib/supabase';
 
 interface Song {
   id: string;
   title: string;
   url: string;
+  storagePath?: string;
 }
 
 interface Post {
   id: string;
   sender: string;
   image: string;
+  imagePath?: string;
   caption: string;
   date: string;
 }
@@ -25,13 +28,52 @@ interface ScheduleItem {
 }
 
 interface Message {
+  id: string;
   sender: string;
   text: string;
   timestamp: number;
 }
 
+type SharedDataType =
+  | 'chat'
+  | 'signal'
+  | 'post'
+  | 'song'
+  | 'schedule'
+  | 'settings'
+  | 'wallpaper'
+  | 'relationship'
+  | 'playback';
+
+interface SharedRecord {
+  id: number;
+  data_type: SharedDataType;
+  item_id: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+interface LeafletMap {
+  remove: () => void;
+  setView: (coordinates: number[], zoom: number) => LeafletMap;
+}
+
+interface LeafletRuntime {
+  map: (container: HTMLElement, options: { zoomControl: boolean; attributionControl: boolean }) => LeafletMap;
+  tileLayer: (url: string, options: { maxZoom: number }) => { addTo: (map: LeafletMap) => void };
+  divIcon: (options: {
+    className: string;
+    html: string;
+    iconSize: [number, number];
+    iconAnchor: [number, number];
+  }) => unknown;
+  marker: (coordinates: number[], options: { icon: unknown }) => {
+    addTo: (map: LeafletMap) => { bindPopup: (content: string) => void };
+  };
+}
+
 export default function Home() {
-  const [session, setSession] = useState<any>(null);
+  const [session, setSession] = useState<Session | null>(null);
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -88,24 +130,111 @@ export default function Home() {
 
   // Wallpaper, Map Avatars & Telemetry States
   const [sharedBgImage, setSharedBgImage] = useState('');
+  const selectedImageFileRef = useRef<File | null>(null);
+  const signedUrlCacheRef = useRef(new Map<string, { url: string; expiresAt: number }>());
   const [batteryLevel, setBatteryLevel] = useState(85);
-  const [distanceKm, setDistanceKm] = useState('10,240 km');
+  const [distanceKm] = useState('10,240 km');
   const [partnerLocalTime, setPartnerLocalTime] = useState('');
 
   const mapContainerRef = useRef<HTMLDivElement>(null);
-  const leafletMapRef = useRef<any>(null);
+  const leafletMapRef = useRef<LeafletMap | null>(null);
 
-  const ROOM_NAME = myCoupleCode ? `room-${myCoupleCode}` : 'heartlink-default';
+  const reportSyncError = (action: string, error: unknown) => {
+    console.error(`Failed to ${action}:`, error);
+    const message = error instanceof Error ? error.message : String(error);
+    alert(`Couldn't ${action}. ${message}`);
+  };
+
+  const saveSharedRecord = async (type: SharedDataType, itemId: string, payload: Record<string, unknown>) => {
+    if (!myCoupleCode) throw new Error('Pair your account before saving shared data.');
+
+    const { error } = await supabase.from('couple_app_data').upsert({
+      couple_code: myCoupleCode,
+      data_type: type,
+      item_id: itemId,
+      payload,
+    }, { onConflict: 'couple_code,data_type,item_id' });
+
+    if (error) throw error;
+  };
+
+  const deleteSharedRecord = async (type: SharedDataType, itemId: string) => {
+    if (!myCoupleCode) throw new Error('Pair your account before deleting shared data.');
+
+    const { error } = await supabase
+      .from('couple_app_data')
+      .delete()
+      .eq('couple_code', myCoupleCode)
+      .eq('data_type', type)
+      .eq('item_id', itemId);
+
+    if (error) throw error;
+  };
+
+  const getSharedMediaUrl = async (path: string) => {
+    const cached = signedUrlCacheRef.current.get(path);
+    if (cached && cached.expiresAt > Date.now() + 60_000) return cached.url;
+
+    const { data, error } = await supabase.storage
+      .from('heartlink-media')
+      .createSignedUrl(path, 86_400);
+
+    if (error) throw error;
+    signedUrlCacheRef.current.set(path, { url: data.signedUrl, expiresAt: Date.now() + 86_400_000 });
+    return data.signedUrl;
+  };
+
+  const uploadSharedMedia = async (file: File, folder: string, itemId: string) => {
+    if (!myCoupleCode) throw new Error('Pair your account before uploading shared media.');
+
+    const extension = file.name.match(/\.[a-z0-9]{1,8}$/i)?.[0] ?? '';
+    const path = `${myCoupleCode}/${folder}/${itemId}${extension}`;
+    const { error } = await supabase.storage
+      .from('heartlink-media')
+      .upload(path, file, { contentType: file.type, upsert: false });
+
+    if (error) throw error;
+    try {
+      return { path, url: await getSharedMediaUrl(path) };
+    } catch (urlError) {
+      const { error: cleanupError } = await supabase.storage.from('heartlink-media').remove([path]);
+      if (cleanupError) console.error('Unable to remove uploaded media after signing failed:', cleanupError);
+      throw urlError;
+    }
+  };
+
+  function triggerHapticPattern(type: string) {
+    if (!('vibrate' in navigator)) return;
+    switch (type) {
+      case 'MISS_YOU': navigator.vibrate([200]); break;
+      case 'NEED_YOU': navigator.vibrate([150, 100, 150]); break;
+      case 'LOVE_YOU': navigator.vibrate([100, 80, 100, 80, 300]); break;
+      case 'SORRY': navigator.vibrate([500, 200, 500, 200, 500]); break;
+      default: navigator.vibrate([100]);
+    }
+  }
 
   useEffect(() => {
+    const checkCoupleStatus = async () => {
+      const { data, error } = await supabase.rpc('get_heartlink_couple');
+      if (error) {
+        reportSyncError('check your couple pairing (run the updated supabase-sync.sql first)', error);
+        setIsPaired(false);
+        return;
+      }
+
+      setMyCoupleCode(data ?? '');
+      setIsPaired(Boolean(data));
+    };
+
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
-      if (session?.user?.email) checkCoupleStatus(session.user.email);
+      if (session?.user?.email) void checkCoupleStatus();
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
-      if (session?.user?.email) checkCoupleStatus(session.user.email);
+      if (session?.user?.email) void checkCoupleStatus();
     });
 
     return () => subscription.unsubscribe();
@@ -122,7 +251,7 @@ export default function Home() {
           hour12: true
         });
         setPartnerLocalTime(swedenTime);
-      } catch (e) {
+      } catch {
         setPartnerLocalTime('Sweden Time Active');
       }
 
@@ -139,7 +268,7 @@ export default function Home() {
           if ('vibrate' in navigator) navigator.vibrate([200, 100, 200, 100, 500]);
           alert("❤️ Happy Monthsary! Another month of long-distance love!");
         }
-      } catch (e) {
+      } catch {
         setRelTimeText('Calculating...');
       }
     };
@@ -156,6 +285,43 @@ export default function Home() {
   }, [messages, activeTab]);
 
   useEffect(() => {
+    if (!audioRef.current || !currentSong) return;
+    audioRef.current.src = currentSong.url;
+    if (isPlaying) {
+      audioRef.current.play().catch((error) => console.error('Unable to play selected audio:', error));
+    } else {
+      audioRef.current.pause();
+    }
+  }, [currentSong, isPlaying]);
+
+  useEffect(() => {
+    if (!isPaired) return;
+
+    type BatteryStatus = {
+      level: number;
+      addEventListener: (event: 'levelchange', listener: () => void) => void;
+      removeEventListener: (event: 'levelchange', listener: () => void) => void;
+    };
+    const getBattery = (navigator as Navigator & { getBattery?: () => Promise<BatteryStatus> }).getBattery;
+    if (!getBattery) return;
+
+    let battery: BatteryStatus | undefined;
+    const updateBatteryLevel = () => {
+      if (battery) setBatteryLevel(Math.round(battery.level * 100));
+    };
+
+    void getBattery.call(navigator).then((result) => {
+      battery = result;
+      updateBatteryLevel();
+      battery.addEventListener('levelchange', updateBatteryLevel);
+    }).catch((error: unknown) => {
+      console.error('Unable to read device battery level:', error);
+    });
+
+    return () => battery?.removeEventListener('levelchange', updateBatteryLevel);
+  }, [isPaired]);
+
+  useEffect(() => {
     if (activeTab !== 'location' || !mapContainerRef.current) return;
 
     if (!document.getElementById('leaflet-css')) {
@@ -166,8 +332,9 @@ export default function Home() {
       document.head.appendChild(link);
     }
 
+    const leafletWindow = window as Window & { L?: LeafletRuntime };
     const loadLeafletScript = () => {
-      if ((window as any).L) {
+      if (leafletWindow.L) {
         initStreetViewMap();
       } else {
         const script = document.createElement('script');
@@ -182,7 +349,8 @@ export default function Home() {
         leafletMapRef.current.remove();
       }
 
-      const L = (window as any).L;
+      const L = leafletWindow.L;
+      if (!L) return;
       const phCoords = [14.1102, 121.1413];
       const seCoords = [56.5517, 14.1384];
 
@@ -229,20 +397,154 @@ export default function Home() {
     loadLeafletScript();
   }, [activeTab, batteryLevel, partnerLocalTime]);
 
-  const checkCoupleStatus = async (userEmail: string) => {
-    const { data } = await supabase
-      .from('couples')
-      .select('*')
-      .or(`user1_email.eq.${userEmail},user2_email.eq.${userEmail}`)
-      .single();
+  useEffect(() => {
+    if (!isPaired || !myCoupleCode || !session?.user?.email) return;
 
-    if (data) {
-      setMyCoupleCode(data.couple_code);
-      setIsPaired(true);
-    } else {
-      setIsPaired(false);
-    }
-  };
+    let isActive = true;
+    let latestLoad = 0;
+    const currentEmail = session.user.email.toLowerCase();
+
+    const loadSharedData = async () => {
+      const loadId = ++latestLoad;
+      const records: SharedRecord[] = [];
+      const pageSize = 1000;
+      for (let offset = 0; ; offset += pageSize) {
+        const { data, error } = await supabase
+          .from('couple_app_data')
+          .select('id,data_type,item_id,payload,created_at')
+          .eq('couple_code', myCoupleCode)
+          .order('created_at', { ascending: true })
+          .order('id', { ascending: true })
+          .range(offset, offset + pageSize - 1)
+          .returns<SharedRecord[]>();
+
+        if (error) {
+          if (isActive) reportSyncError('load shared data (run supabase-sync.sql in Supabase SQL Editor first)', error);
+          return;
+        }
+        records.push(...(data ?? []));
+        if (!data || data.length < pageSize) break;
+        if (!isActive || loadId !== latestLoad) return;
+      }
+      if (!isActive || loadId !== latestLoad) return;
+
+      try {
+        const storedMessages = records
+          .filter((record) => record.data_type === 'chat' || record.data_type === 'signal')
+          .map((record) => {
+            const payload = record.payload;
+            return {
+              id: record.item_id,
+              sender: String(payload.sender_email ?? '').toLowerCase() === currentEmail ? 'You' : 'Partner',
+              text: String(payload.text ?? ''),
+              timestamp: Number(payload.timestamp ?? Date.parse(record.created_at)),
+            };
+          })
+          .sort((a, b) => a.timestamp - b.timestamp);
+        const lastSignal = records
+          .filter((record) => record.data_type === 'signal'
+            && String(record.payload.sender_email ?? '').toLowerCase() !== currentEmail)
+          .at(-1)?.payload;
+
+        const storedPosts = await Promise.all(records
+          .filter((record) => record.data_type === 'post')
+          .map(async (record) => {
+            const payload = record.payload;
+            const imagePath = typeof payload.imagePath === 'string' ? payload.imagePath : undefined;
+            return {
+              id: record.item_id,
+              sender: String(payload.sender_email ?? '').toLowerCase() === currentEmail ? 'You' : 'Partner',
+              image: imagePath ? await getSharedMediaUrl(imagePath) : String(payload.image ?? ''),
+              imagePath,
+              caption: String(payload.caption ?? ''),
+              date: String(payload.date ?? ''),
+              createdAt: record.created_at,
+            };
+          }));
+
+        const storedSongs = await Promise.all(records
+          .filter((record) => record.data_type === 'song')
+          .map(async (record) => {
+            const payload = record.payload;
+            const storagePath = String(payload.storagePath ?? '');
+            return {
+              id: record.item_id,
+              title: String(payload.title ?? ''),
+              url: storagePath ? await getSharedMediaUrl(storagePath) : '',
+              storagePath,
+            };
+          }));
+
+        const settings = records.find((record) => record.data_type === 'settings')?.payload;
+        const schedules = records
+          .filter((record) => record.data_type === 'schedule')
+          .map((record) => ({
+            id: record.item_id,
+            title: String(record.payload.title ?? ''),
+            time: String(record.payload.time ?? ''),
+            sign: String(record.payload.sign ?? '📌'),
+          }));
+
+        const wallpaper = records.find((record) => record.data_type === 'wallpaper')?.payload;
+        const wallpaperUrl = typeof wallpaper?.path === 'string' ? await getSharedMediaUrl(wallpaper.path) : '';
+        const relationship = records.find((record) => record.data_type === 'relationship')?.payload;
+        const playback = records.find((record) => record.data_type === 'playback')?.payload;
+        const playingSong = storedSongs.find((song) => song.id === playback?.songId) ?? null;
+
+        if (!isActive || loadId !== latestLoad) return;
+        setMessages(storedMessages);
+        setLastReceived(typeof lastSignal?.text === 'string' ? lastSignal.text : '');
+        setPosts(storedPosts.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)));
+        setPlaylist(storedSongs);
+        if (settings?.tapMeanings && typeof settings.tapMeanings === 'object') {
+          setTapMeanings(settings.tapMeanings as typeof tapMeanings);
+          setTempMeanings(settings.tapMeanings as typeof tapMeanings);
+        }
+        if (typeof settings?.isSyncedMusic === 'boolean') setIsSyncedMusic(settings.isSyncedMusic);
+        setSchedules(schedules);
+        setSharedBgImage(wallpaperUrl);
+        if (typeof relationship?.startDate === 'string') setRelationshipStartDate(relationship.startDate);
+        setCurrentSong(playingSong);
+        setIsPlaying(Boolean(playback?.isPlaying) && settings?.isSyncedMusic !== false);
+      } catch (error) {
+        if (isActive) reportSyncError('load shared media and settings', error);
+      }
+    };
+
+    void loadSharedData();
+
+    const channel = supabase
+      .channel(`shared-data-${myCoupleCode}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'couple_app_data',
+        filter: `couple_code=eq.${myCoupleCode}`,
+      }, (payload) => {
+        const changedRecord = payload.new as SharedRecord | undefined;
+        if (changedRecord?.data_type === 'signal') {
+          const senderEmail = String(changedRecord.payload.sender_email ?? '').toLowerCase();
+          if (senderEmail !== currentEmail) {
+            setLastReceived(String(changedRecord.payload.text ?? ''));
+            triggerHapticPattern(String(changedRecord.payload.hapticType ?? ''));
+          }
+        } else if (changedRecord?.data_type === 'chat') {
+          const senderEmail = String(changedRecord.payload.sender_email ?? '').toLowerCase();
+          if (senderEmail !== currentEmail && 'vibrate' in navigator) navigator.vibrate(100);
+        }
+        void loadSharedData();
+      })
+      .subscribe((status) => {
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          reportSyncError('connect live data sync', new Error(`Supabase Realtime status: ${status}`));
+        }
+      });
+
+    return () => {
+      isActive = false;
+      void supabase.removeChannel(channel);
+    };
+  }, [isPaired, myCoupleCode, session?.user?.email]);
 
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -268,15 +570,21 @@ export default function Home() {
   const generateNewCode = async () => {
     if (!session?.user?.email) return;
     setLoading(true);
-    const generatedCode = 'HL-' + Math.floor(1000 + Math.random() * 9000);
-    
-    await supabase.from('couples').upsert([
-      { couple_code: generatedCode, user1_email: session.user.email }
-    ], { onConflict: 'user1_email' });
+    try {
+      const generatedCode = 'HL-' + Math.floor(1000 + Math.random() * 9000);
+      const { data, error } = await supabase.rpc('create_heartlink_couple', {
+        target_code: generatedCode,
+      });
+      if (error) throw error;
 
-    setMyCoupleCode(generatedCode);
-    setLoading(false);
-    alert(`Your Couple Code is: ${generatedCode}. Share this with your partner!`);
+      setMyCoupleCode(data);
+      setIsPaired(true);
+      alert(`Your Couple Code is: ${data}. Share this with your partner!`);
+    } catch (error) {
+      reportSyncError('create a couple code', error);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handlePairingSubmit = async (e: React.FormEvent) => {
@@ -285,129 +593,72 @@ export default function Home() {
     setLoading(true);
 
     const cleanCode = coupleCodeInput.trim().toUpperCase();
+    try {
+      const { data, error } = await supabase.rpc('join_heartlink_couple', {
+        target_code: cleanCode,
+      });
+      if (error) throw error;
 
-    const { data, error } = await supabase
-      .from('couples')
-      .select('*')
-      .eq('couple_code', cleanCode)
-      .single();
-
-    if (error || !data) {
-      alert('Couple Code not found. Please ask your partner to generate one first!');
-    } else {
-      await supabase
-        .from('couples')
-        .update({ user2_email: session.user.email })
-        .eq('couple_code', cleanCode);
-
-      setMyCoupleCode(cleanCode);
+      setMyCoupleCode(data);
       setIsPaired(true);
       setShowSettings(false);
       alert('Successfully paired with your partner! ❤️');
-    }
-    setLoading(false);
-  };
-
-  useEffect(() => {
-    if (!isPaired || !myCoupleCode) return;
-
-    if ('getBattery' in navigator) {
-      (navigator as any).getBattery().then((bat: any) => {
-        setBatteryLevel(Math.round(bat.level * 100));
-        bat.addEventListener('levelchange', () => {
-          setBatteryLevel(Math.round(bat.level * 100));
-        });
-      });
-    }
-
-    const channel = supabase.channel(ROOM_NAME);
-
-    channel
-      .on('broadcast', { event: 'HEARTLINK_PAYLOAD' }, (payload: any) => {
-        const { type, data } = payload.payload;
-
-        if (type === 'TOUCH' || type === 'SORRY') {
-          setLastReceived(data.message);
-          triggerHapticPattern(data.hapticType);
-          setMessages((prev) => [...prev, { sender: 'Partner', text: data.message, timestamp: Date.now() }]);
-        } else if (type === 'CHAT') {
-          setMessages((prev) => [...prev, data]);
-          if ('vibrate' in navigator) navigator.vibrate(100);
-        } else if (type === 'POST') {
-          setPosts((prev) => [data, ...prev]);
-        } else if (type === 'DELETE_POST') {
-          setPosts((prev) => prev.filter((p) => p.id !== data.id));
-        } else if (type === 'MUSIC_UPLOAD') {
-          setPlaylist((prev) => [...prev, data]);
-        } else if (type === 'MUSIC_DELETE') {
-          setPlaylist((prev) => prev.filter((s) => s.id !== data.id));
-        } else if (type === 'MUSIC_SYNC' && isSyncedMusic) {
-          setCurrentSong(data.song);
-          setIsPlaying(data.isPlaying);
-          if (audioRef.current) {
-            if (data.isPlaying) audioRef.current.play().catch(() => {});
-            else audioRef.current.pause();
-          }
-        } else if (type === 'SCHEDULE') {
-          setSchedules((prev) => [...prev, data]);
-        } else if (type === 'DELETE_SCHEDULE') {
-          setSchedules((prev) => prev.filter((s) => s.id !== data.id));
-        } else if (type === 'SETTINGS') {
-          setTapMeanings(data);
-        } else if (type === 'WALLPAPER') {
-          setSharedBgImage(data.image);
-        }
-      })
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [isPaired, myCoupleCode, isSyncedMusic]);
-
-  const triggerHapticPattern = (type: string) => {
-    if (!('vibrate' in navigator)) return;
-    switch (type) {
-      case 'MISS_YOU': navigator.vibrate([200]); break;
-      case 'NEED_YOU': navigator.vibrate([150, 100, 150]); break;
-      case 'LOVE_YOU': navigator.vibrate([100, 80, 100, 80, 300]); break;
-      case 'SORRY': navigator.vibrate([500, 200, 500, 200, 500]); break;
-      default: navigator.vibrate([100]);
+    } catch (error) {
+      reportSyncError('join your partner using that couple code', error);
+    } finally {
+      setLoading(false);
     }
   };
 
   const sendPayload = async (type: string, hapticType: string, message: string) => {
-    const channel = supabase.channel(ROOM_NAME);
-    const newMsg = { sender: 'You', text: message, timestamp: Date.now() };
-
-    await channel.send({
-      type: 'broadcast',
-      event: 'HEARTLINK_PAYLOAD',
-      payload: { type, data: { hapticType, message, timestamp: Date.now() } },
-    });
-
-    setMessages((prev) => [...prev, newMsg]);
+    const id = crypto.randomUUID();
+    const timestamp = Date.now();
+    try {
+      await saveSharedRecord('signal', id, {
+        text: message,
+        timestamp,
+        sender_email: session?.user?.email ?? '',
+        hapticType,
+        signalType: type,
+      });
+      setLastReceived(message);
+      setMessages((prev) => prev.some((item) => item.id === id)
+        ? prev
+        : [...prev, { id, sender: 'You', text: message, timestamp }]);
+    } catch (error) {
+      reportSyncError('save your tap signal', error);
+    }
   };
 
   const sendChatMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputMessage.trim()) return;
+    const text = inputMessage.trim();
+    if (!text) return;
 
-    const newMsg = { sender: 'You', text: inputMessage, timestamp: Date.now() };
-    const channel = supabase.channel(ROOM_NAME);
-    await channel.send({
-      type: 'broadcast',
-      event: 'HEARTLINK_PAYLOAD',
-      payload: { type: 'CHAT', data: { sender: 'Partner', text: inputMessage, timestamp: Date.now() } },
-    });
-
-    setMessages((prev) => [...prev, newMsg]);
-    setInputMessage('');
+    const timestamp = Date.now();
+    const id = crypto.randomUUID();
+    try {
+      await saveSharedRecord('chat', id, {
+        text,
+        timestamp,
+        sender_email: session?.user?.email ?? '',
+      });
+      setMessages((prev) => prev.some((item) => item.id === id)
+        ? prev
+        : [...prev, { id, sender: 'You', text, timestamp }]);
+      setInputMessage('');
+    } catch (error) {
+      reportSyncError('save your message', error);
+    }
   };
 
   const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) setImagePreview(URL.createObjectURL(file));
+    if (file) {
+      if (imagePreview.startsWith('blob:')) URL.revokeObjectURL(imagePreview);
+      selectedImageFileRef.current = file;
+      setImagePreview(URL.createObjectURL(file));
+    }
   };
 
   const handleCreatePost = async (e: React.FormEvent) => {
@@ -417,109 +668,135 @@ export default function Home() {
     const now = new Date();
     const formattedDate = `${now.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} at ${now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`;
 
-    const newPost: Post = {
-      id: Date.now().toString(),
-      sender: 'You',
-      image: imagePreview || 'https://images.unsplash.com/photo-1518199266791-5375a83190b7?w=600&auto=format&fit=crop&q=60',
-      caption: postCaption,
-      date: formattedDate
-    };
+    const id = crypto.randomUUID();
+    let uploadedPath: string | undefined;
+    try {
+      let image = 'https://images.unsplash.com/photo-1518199266791-5375a83190b7?w=600&auto=format&fit=crop&q=60';
+      if (selectedImageFileRef.current) {
+        const uploaded = await uploadSharedMedia(selectedImageFileRef.current, 'moments', id);
+        image = uploaded.url;
+        uploadedPath = uploaded.path;
+      }
 
-    const channel = supabase.channel(ROOM_NAME);
-    await channel.send({
-      type: 'broadcast',
-      event: 'HEARTLINK_PAYLOAD',
-      payload: { type: 'POST', data: { ...newPost, sender: 'Partner' } },
-    });
+      const newPost: Post = {
+        id,
+        sender: 'You',
+        image,
+        imagePath: uploadedPath,
+        caption: postCaption,
+        date: formattedDate,
+      };
+      await saveSharedRecord('post', id, {
+        sender_email: session?.user?.email ?? '',
+        imagePath: uploadedPath,
+        image: uploadedPath ? undefined : image,
+        caption: postCaption,
+        date: formattedDate,
+      });
 
-    setPosts((prev) => [newPost, ...prev]);
-    setPostCaption('');
-    setImagePreview('');
-    if (fileInputRef.current) fileInputRef.current.value = '';
+      setPosts((prev) => [newPost, ...prev.filter((post) => post.id !== id)]);
+      setPostCaption('');
+      if (imagePreview.startsWith('blob:')) URL.revokeObjectURL(imagePreview);
+      selectedImageFileRef.current = null;
+      setImagePreview('');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    } catch (error) {
+      if (uploadedPath) {
+        const { error: cleanupError } = await supabase.storage.from('heartlink-media').remove([uploadedPath]);
+        if (cleanupError) console.error('Unable to remove moment media after save failed:', cleanupError);
+      }
+      reportSyncError('save your moment', error);
+    }
   };
 
   const handleDeletePost = async (postId: string) => {
-    const channel = supabase.channel(ROOM_NAME);
-    await channel.send({
-      type: 'broadcast',
-      event: 'HEARTLINK_PAYLOAD',
-      payload: { type: 'DELETE_POST', data: { id: postId } },
-    });
-
-    setPosts((prev) => prev.filter((p) => p.id !== postId));
+    const post = posts.find((item) => item.id === postId);
+    try {
+      await deleteSharedRecord('post', postId);
+      setPosts((prev) => prev.filter((item) => item.id !== postId));
+      if (post?.imagePath) {
+        const { error } = await supabase.storage.from('heartlink-media').remove([post.imagePath]);
+        if (error) reportSyncError('delete the moment photo', error);
+      }
+    } catch (error) {
+      reportSyncError('delete your moment', error);
+    }
   };
 
   const handleWallpaperUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = async (uploadEvent) => {
-        const base64Image = uploadEvent.target?.result as string;
-        setSharedBgImage(base64Image);
-
-        const channel = supabase.channel(ROOM_NAME);
-        await channel.send({
-          type: 'broadcast',
-          event: 'HEARTLINK_PAYLOAD',
-          payload: { type: 'WALLPAPER', data: { image: base64Image } }
-        });
-      };
-      reader.readAsDataURL(file);
+    if (!file) return;
+    let uploadedPath: string | undefined;
+    try {
+      const uploaded = await uploadSharedMedia(file, 'wallpapers', crypto.randomUUID());
+      uploadedPath = uploaded.path;
+      await saveSharedRecord('wallpaper', 'current', { path: uploaded.path });
+      setSharedBgImage(uploaded.url);
+    } catch (error) {
+      if (uploadedPath) {
+        const { error: cleanupError } = await supabase.storage.from('heartlink-media').remove([uploadedPath]);
+        if (cleanupError) console.error('Unable to remove wallpaper media after save failed:', cleanupError);
+      }
+      reportSyncError('save the shared wallpaper', error);
     }
   };
 
-  const handleMusicUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleMusicUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
+    if (!file) return;
+    const id = crypto.randomUUID();
+    let uploadedPath: string | undefined;
+    try {
+      const uploaded = await uploadSharedMedia(file, 'music', id);
+      uploadedPath = uploaded.path;
       const songData: Song = {
-        id: Date.now().toString(),
-        title: file.name.replace(/\.[^/.]+$/, ""),
-        url: URL.createObjectURL(file)
+        id,
+        title: file.name.replace(/\.[^/.]+$/, ''),
+        url: uploaded.url,
+        storagePath: uploaded.path,
       };
-
-      const channel = supabase.channel(ROOM_NAME);
-      channel.send({
-        type: 'broadcast',
-        event: 'HEARTLINK_PAYLOAD',
-        payload: { type: 'MUSIC_UPLOAD', data: songData }
+      await saveSharedRecord('song', id, {
+        title: songData.title,
+        storagePath: uploaded.path,
       });
-
-      setPlaylist((prev) => [...prev, songData]);
+      setPlaylist((prev) => [...prev.filter((song) => song.id !== id), songData]);
       if (musicInputRef.current) musicInputRef.current.value = '';
+    } catch (error) {
+      if (uploadedPath) {
+        const { error: cleanupError } = await supabase.storage.from('heartlink-media').remove([uploadedPath]);
+        if (cleanupError) console.error('Unable to remove audio media after save failed:', cleanupError);
+      }
+      reportSyncError('save the audio file', error);
     }
   };
 
   const handleDeleteSong = async (songId: string) => {
-    const channel = supabase.channel(ROOM_NAME);
-    await channel.send({
-      type: 'broadcast',
-      event: 'HEARTLINK_PAYLOAD',
-      payload: { type: 'MUSIC_DELETE', data: { id: songId } }
-    });
-
-    setPlaylist((prev) => prev.filter((s) => s.id !== songId));
-    if (currentSong?.id === songId) {
-      setCurrentSong(null);
-      setIsPlaying(false);
-      if (audioRef.current) audioRef.current.pause();
+    const song = playlist.find((item) => item.id === songId);
+    try {
+      await deleteSharedRecord('song', songId);
+      setPlaylist((prev) => prev.filter((item) => item.id !== songId));
+      if (currentSong?.id === songId) {
+        setCurrentSong(null);
+        setIsPlaying(false);
+        if (audioRef.current) audioRef.current.pause();
+        await deleteSharedRecord('playback', 'current');
+      }
+      if (song?.storagePath) {
+        const { error } = await supabase.storage.from('heartlink-media').remove([song.storagePath]);
+        if (error) reportSyncError('delete the audio file', error);
+      }
+    } catch (error) {
+      reportSyncError('delete the audio file', error);
     }
   };
 
   const playSong = async (song: Song) => {
-    setCurrentSong(song);
-    setIsPlaying(true);
-    if (audioRef.current) {
-      audioRef.current.src = song.url;
-      audioRef.current.play().catch(() => {});
-    }
-
-    if (isSyncedMusic) {
-      const channel = supabase.channel(ROOM_NAME);
-      await channel.send({
-        type: 'broadcast',
-        event: 'HEARTLINK_PAYLOAD',
-        payload: { type: 'MUSIC_SYNC', data: { song, isPlaying: true } }
-      });
+    try {
+      await saveSharedRecord('playback', 'current', { songId: song.id, isPlaying: true });
+      setCurrentSong(song);
+      setIsPlaying(true);
+    } catch (error) {
+      reportSyncError('save music playback progress', error);
     }
   };
 
@@ -529,20 +806,36 @@ export default function Home() {
       return;
     }
     const newPlayingState = !isPlaying;
-    setIsPlaying(newPlayingState);
-
-    if (audioRef.current) {
-      if (newPlayingState) audioRef.current.play().catch(() => {});
-      else audioRef.current.pause();
-    }
-
-    if (isSyncedMusic) {
-      const channel = supabase.channel(ROOM_NAME);
-      await channel.send({
-        type: 'broadcast',
-        event: 'HEARTLINK_PAYLOAD',
-        payload: { type: 'MUSIC_SYNC', data: { song: currentSong, isPlaying: newPlayingState } }
+    try {
+      await saveSharedRecord('playback', 'current', {
+        songId: currentSong?.id ?? null,
+        isPlaying: newPlayingState,
       });
+      setIsPlaying(newPlayingState);
+    } catch (error) {
+      reportSyncError('save music playback progress', error);
+    }
+  };
+
+  const toggleMusicSync = async () => {
+    const nextValue = !isSyncedMusic;
+    try {
+      await saveSharedRecord('settings', 'current', {
+        tapMeanings,
+        isSyncedMusic: nextValue,
+      });
+      setIsSyncedMusic(nextValue);
+    } catch (error) {
+      reportSyncError('save music sync settings', error);
+    }
+  };
+
+  const updateRelationshipStartDate = async (startDate: string) => {
+    try {
+      await saveSharedRecord('relationship', 'start-date', { startDate });
+      setRelationshipStartDate(startDate);
+    } catch (error) {
+      reportSyncError('save the relationship start date', error);
     }
   };
 
@@ -576,15 +869,16 @@ export default function Home() {
   };
 
   const saveSettings = async () => {
-    setTapMeanings(tempMeanings);
-    setShowSettings(false);
-
-    const channel = supabase.channel(ROOM_NAME);
-    await channel.send({
-      type: 'broadcast',
-      event: 'HEARTLINK_PAYLOAD',
-      payload: { type: 'SETTINGS', data: tempMeanings },
-    });
+    try {
+      await saveSharedRecord('settings', 'current', {
+        tapMeanings: tempMeanings,
+        isSyncedMusic,
+      });
+      setTapMeanings(tempMeanings);
+      setShowSettings(false);
+    } catch (error) {
+      reportSyncError('save your shared settings', error);
+    }
   };
 
   const addSchedule = async (e: React.FormEvent) => {
@@ -592,33 +886,33 @@ export default function Home() {
     if (!newTitle || !newTime) return;
 
     const schedItem: ScheduleItem = {
-      id: Date.now().toString(),
+      id: crypto.randomUUID(),
       title: newTitle,
       time: newTime,
       sign: newSign,
     };
 
-    const channel = supabase.channel(ROOM_NAME);
-    await channel.send({
-      type: 'broadcast',
-      event: 'HEARTLINK_PAYLOAD',
-      payload: { type: 'SCHEDULE', data: schedItem },
-    });
-
-    setSchedules((prev) => [...prev, schedItem]);
-    setNewTitle('');
-    setNewTime('');
+    try {
+      await saveSharedRecord('schedule', schedItem.id, {
+        title: schedItem.title,
+        time: schedItem.time,
+        sign: schedItem.sign,
+      });
+      setSchedules((prev) => [...prev.filter((item) => item.id !== schedItem.id), schedItem]);
+      setNewTitle('');
+      setNewTime('');
+    } catch (error) {
+      reportSyncError('save your schedule item', error);
+    }
   };
 
   const handleDeleteSchedule = async (schedId: string) => {
-    const channel = supabase.channel(ROOM_NAME);
-    await channel.send({
-      type: 'broadcast',
-      event: 'HEARTLINK_PAYLOAD',
-      payload: { type: 'DELETE_SCHEDULE', data: { id: schedId } },
-    });
-
-    setSchedules((prev) => prev.filter((s) => s.id !== schedId));
+    try {
+      await deleteSharedRecord('schedule', schedId);
+      setSchedules((prev) => prev.filter((item) => item.id !== schedId));
+    } catch (error) {
+      reportSyncError('delete your schedule item', error);
+    }
   };
 
   if (!session) {
@@ -762,10 +1056,10 @@ export default function Home() {
               {messages.length === 0 ? (
                 <p className="text-center text-slate-500 text-xs italic mt-20">No messages or signals recorded yet.</p>
               ) : (
-                messages.map((msg, index) => {
+                messages.map((msg) => {
                   const isMe = msg.sender === 'You';
                   return (
-                    <div key={index} className={`flex ${isMe ? 'justify-end' : 'justify-start'} items-end gap-2`}>
+                    <div key={msg.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'} items-end gap-2`}>
                       {!isMe && (
                         <div className="w-6 h-6 rounded-full bg-purple-600 flex items-center justify-center text-[10px] font-bold text-white shadow shrink-0">
                           GF
@@ -911,7 +1205,7 @@ export default function Home() {
                 <p className="text-[10px] text-slate-400">Shared couple radio station</p>
               </div>
               <button
-                onClick={() => setIsSyncedMusic(!isSyncedMusic)}
+                onClick={toggleMusicSync}
                 className={`px-3 py-1.5 rounded-xl text-[10px] font-bold transition cursor-pointer ${
                   isSyncedMusic ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-slate-800 text-slate-400'
                 }`}
@@ -1104,7 +1398,7 @@ export default function Home() {
                 </div>
               ) : pairingAction === 'enter' ? (
                 <form onSubmit={handlePairingSubmit} className="space-y-2 pt-1">
-                  <p className="text-[11px] text-slate-400">Enter your partner's code below:</p>
+                  <p className="text-[11px] text-slate-400">Enter your partner&apos;s code below:</p>
                   <input
                     type="text"
                     required
@@ -1145,7 +1439,7 @@ export default function Home() {
               <input
                 type="date"
                 value={relationshipStartDate}
-                onChange={(e) => setRelationshipStartDate(e.target.value)}
+                onChange={(e) => updateRelationshipStartDate(e.target.value)}
                 className="w-full bg-[#101625] border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-pink-500"
               />
             </div>
