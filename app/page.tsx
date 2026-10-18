@@ -61,6 +61,7 @@ interface SharedLocation {
   accuracy: number;
   updatedAt: number;
   userId: string;
+  timeZone?: string;
 }
 
 interface LeafletMap {
@@ -98,6 +99,37 @@ const LOCATION_MAX_AGE_MS = 2 * 60 * 1000;
 function isLocationFresh(location: SharedLocation | null, now: number) {
   if (!location || now < location.updatedAt) return false;
   return now - location.updatedAt < LOCATION_MAX_AGE_MS;
+}
+
+function getSupportedTimeZone(value: unknown) {
+  if (typeof value !== 'string' || !value) return null;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value });
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function getLocationSyncErrorMessage(error: unknown) {
+  const databaseError = error && typeof error === 'object'
+    ? error as { code?: string; message?: string }
+    : {};
+  if (databaseError.code === '23514') {
+    return 'Supabase is missing the location schema update. Run supabase-ldr-features.sql after supabase-sync.sql.';
+  }
+  if (databaseError.code === '42501') {
+    return 'Supabase blocked this location write. Run the latest supabase-ldr-features.sql policies and confirm you are signed in.';
+  }
+  if (databaseError.code === '42P01' || databaseError.code === 'PGRST205') {
+    return 'The shared-data table is missing. Run supabase-sync.sql and then supabase-ldr-features.sql in Supabase SQL Editor.';
+  }
+  if (error instanceof TypeError && /fetch|network/i.test(error.message)) {
+    return 'Network connection lost while syncing location. Heartlink will retry automatically.';
+  }
+
+  console.error('Location database sync error details:', error);
+  return 'Could not sync location. Check the Supabase SQL migrations and connection; Heartlink will retry automatically.';
 }
 
 function decodeVapidPublicKey(value: string) {
@@ -177,6 +209,7 @@ export default function Home() {
   const [isPushEnabled, setIsPushEnabled] = useState(false);
   const [pushError, setPushError] = useState('');
   const [partnerLocalTime, setPartnerLocalTime] = useState('');
+  const [notificationNotice, setNotificationNotice] = useState('');
   const [isMapReady, setIsMapReady] = useState(false);
 
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -187,7 +220,6 @@ export default function Home() {
   });
   const hasFittedLocationsRef = useRef(false);
   const lastSavedLocationRef = useRef<{ latitude: number; longitude: number; savedAt: number } | null>(null);
-  const isSavingLocationRef = useRef(false);
 
   const reportSyncError = (action: string, error: unknown) => {
     console.error(`Failed to ${action}:`, error);
@@ -333,18 +365,18 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    const partnerTimeZone = partnerLocation?.timeZone;
     const updateTimer = () => {
-      try {
-        const swedenTime = new Date().toLocaleTimeString('en-US', {
-          timeZone: 'Europe/Stockholm',
+      if (partnerTimeZone && isLocationFresh(partnerLocation, Date.now())) {
+        setPartnerLocalTime(new Date().toLocaleTimeString('en-US', {
+          timeZone: partnerTimeZone,
           hour: '2-digit',
           minute: '2-digit',
           second: '2-digit',
-          hour12: true
-        });
-        setPartnerLocalTime(swedenTime);
-      } catch {
-        setPartnerLocalTime('Sweden Time Active');
+          hour12: true,
+        }));
+      } else {
+        setPartnerLocalTime('Waiting for partner location');
       }
 
       try {
@@ -368,7 +400,7 @@ export default function Home() {
     updateTimer();
     const interval = setInterval(updateTimer, 1000);
     return () => clearInterval(interval);
-  }, [relationshipStartDate]);
+  }, [relationshipStartDate, partnerLocation]);
 
   useEffect(() => {
     if (activeTab === 'chat') {
@@ -529,9 +561,58 @@ export default function Home() {
 
   useEffect(() => {
     if (!isSharingLocation || !isPaired || !session?.user?.id || !myCoupleCode) return;
+    let isActive = true;
+    let pendingLocation: SharedLocation | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let retryCount = 0;
+    let isSaving = false;
+    const userId = session.user.id;
+
+    const scheduleRetry = () => {
+      if (!isActive || retryTimer || !navigator.onLine) return;
+      const delay = Math.min(1000 * 2 ** retryCount, 30_000);
+      retryCount += 1;
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        void savePendingLocation();
+      }, delay);
+    };
+
+    const savePendingLocation = async () => {
+      if (!isActive || isSaving || !pendingLocation) return;
+      isSaving = true;
+      const location = pendingLocation;
+      pendingLocation = null;
+      try {
+        await saveSharedRecord('location', userId, {
+          latitude: location.latitude,
+          longitude: location.longitude,
+          accuracy: location.accuracy,
+          user_id: userId,
+          time_zone: location.timeZone,
+        });
+        lastSavedLocationRef.current = {
+          latitude: location.latitude,
+          longitude: location.longitude,
+          savedAt: location.updatedAt,
+        };
+        retryCount = 0;
+        setLocationError('');
+      } catch (error) {
+        console.error('Unable to share current location:', error);
+        setLocationError(getLocationSyncErrorMessage(error));
+        pendingLocation ??= location;
+        scheduleRetry();
+      } finally {
+        isSaving = false;
+        if (pendingLocation && !retryTimer) void savePendingLocation();
+      }
+    };
+
     const watchId = navigator.geolocation.watchPosition((position) => {
       const { latitude, longitude, accuracy } = position.coords;
       const now = Date.now();
+      const timeZone = getSupportedTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone) ?? undefined;
       const previous = lastSavedLocationRef.current;
       const distanceMoved = previous
         ? 6371000 * 2 * Math.asin(Math.sqrt(
@@ -546,42 +627,49 @@ export default function Home() {
         longitude,
         accuracy,
         updatedAt: now,
-        userId: session.user.id,
+        userId,
+        timeZone,
       };
 
       setOwnLocation(location);
       setLocationNow(now);
-      if (isSavingLocationRef.current
-        || (previous && distanceMoved < 20 && now - previous.savedAt < 20_000)) return;
+      if (previous && distanceMoved < 20 && now - previous.savedAt < 20_000) return;
 
-      isSavingLocationRef.current = true;
-      void saveSharedRecord('location', session.user.id, {
-        latitude,
-        longitude,
-        accuracy,
-        user_id: session.user.id,
-      }).then(() => {
-        lastSavedLocationRef.current = { latitude, longitude, savedAt: now };
-      }).catch((error: unknown) => {
-        console.error('Unable to share current location:', error);
-        setLocationError('Could not sync your location. Check the database setup and your connection.');
-        setIsSharingLocation(false);
-      }).finally(() => {
-        isSavingLocationRef.current = false;
-      });
+      pendingLocation = location;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      void savePendingLocation();
     }, (error) => {
       console.error('Unable to read current location:', error);
-      setLocationError(error.code === error.PERMISSION_DENIED
-        ? 'Location permission was denied. Allow location access in Chrome settings to share.'
-        : 'Could not get your location. Check GPS and try again.');
-      setIsSharingLocation(false);
+      if (error.code === error.PERMISSION_DENIED) {
+        setLocationError('Location permission was denied. Allow location access in Chrome settings to share.');
+        setIsSharingLocation(false);
+      } else {
+        setLocationError('Waiting for a GPS fix. Keep location enabled; Heartlink will continue trying.');
+      }
     }, {
       enableHighAccuracy: true,
       maximumAge: 5000,
       timeout: 20_000,
     });
 
-    return () => navigator.geolocation.clearWatch(watchId);
+    const handleOnline = () => {
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      void savePendingLocation();
+    };
+    window.addEventListener('online', handleOnline);
+
+    return () => {
+      isActive = false;
+      if (retryTimer) clearTimeout(retryTimer);
+      window.removeEventListener('online', handleOnline);
+      navigator.geolocation.clearWatch(watchId);
+    };
   }, [isSharingLocation, isPaired, session?.user?.id, myCoupleCode, saveSharedRecord]);
 
   useEffect(() => {
@@ -679,6 +767,7 @@ export default function Home() {
               accuracy: Number.isFinite(accuracy) ? accuracy : 0,
               updatedAt,
               userId: String(payload.user_id ?? ''),
+              timeZone: getSupportedTimeZone(payload.time_zone) ?? undefined,
             };
           })
           .filter((location): location is SharedLocation => location !== null);
@@ -899,6 +988,7 @@ export default function Home() {
 
   const enablePushNotifications = async () => {
     setPushError('');
+    setNotificationNotice('');
     if (!isPaired || !session) {
       setPushError('Pair your account before enabling notifications.');
       return;
@@ -924,28 +1014,66 @@ export default function Home() {
       }
 
       const registration = await navigator.serviceWorker.ready;
-      const subscription = await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: decodeVapidPublicKey(publicKey),
-      });
+      let subscription = await registration.pushManager.getSubscription();
+      let createdSubscription = false;
+      const configuredKey = new Uint8Array(decodeVapidPublicKey(publicKey));
+      const existingKey = subscription?.options.applicationServerKey;
+      const hasMatchingKey = existingKey instanceof ArrayBuffer
+        && new Uint8Array(existingKey).every((byte, index) => byte === configuredKey[index])
+        && new Uint8Array(existingKey).length === configuredKey.length;
+      if (subscription && !hasMatchingKey) {
+        const oldEndpoint = subscription.endpoint;
+        const removeResponse = await fetch('/api/push/subscribe', {
+          method: 'DELETE',
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ endpoint: oldEndpoint }),
+        });
+        if (!removeResponse.ok) {
+          throw new Error('Could not refresh this device notification key. Disable and re-enable notifications in Settings.');
+        }
+        await subscription.unsubscribe();
+        subscription = null;
+      }
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: decodeVapidPublicKey(publicKey),
+        });
+        createdSubscription = true;
+      }
       const response = await fetch('/api/push/subscribe', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${session.access_token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(subscription),
+        body: JSON.stringify({
+          subscription: subscription.toJSON(),
+          vapidPublicKey: publicKey,
+        }),
       });
       if (!response.ok) {
-        const result = await response.json() as { error?: string };
-        await subscription.unsubscribe();
-        throw new Error(result.error ?? 'Could not save the push subscription.');
+        let message = 'Could not save the push subscription.';
+        try {
+          const result = await response.json() as { error?: string };
+          if (typeof result.error === 'string') message = result.error;
+        } catch (error) {
+          console.error('Unable to read push-subscription setup response:', error);
+        }
+        if (createdSubscription) await subscription.unsubscribe();
+        throw new Error(message);
       }
 
       setIsPushEnabled(true);
+      setPushError('');
+      setNotificationNotice('Notifications are enabled on this device.');
     } catch (error) {
       console.error('Unable to enable partner notifications:', error);
       setPushError(error instanceof Error ? error.message : 'Could not enable notifications.');
+      setNotificationNotice('Could not enable notifications. See the details in Settings.');
     }
   };
 
@@ -970,21 +1098,30 @@ export default function Home() {
         body: JSON.stringify({ endpoint: subscription.endpoint }),
       });
       if (!response.ok) {
-        const result = await response.json() as { error?: string };
-        throw new Error(result.error ?? 'Could not remove the push subscription.');
+        let message = 'Could not remove the push subscription.';
+        try {
+          const result = await response.json() as { error?: string };
+          if (typeof result.error === 'string') message = result.error;
+        } catch (error) {
+          console.error('Unable to read push-subscription removal response:', error);
+        }
+        throw new Error(message);
       }
 
       const unsubscribed = await subscription.unsubscribe();
       if (!unsubscribed) throw new Error('Chrome did not remove the push subscription.');
       setIsPushEnabled(false);
+      setNotificationNotice('Notifications are disabled on this device.');
     } catch (error) {
       console.error('Unable to disable partner notifications:', error);
       setPushError(error instanceof Error ? error.message : 'Could not disable notifications.');
+      setNotificationNotice('Could not disable notifications. See the details in Settings.');
     }
   };
 
   const notifyPartner = async (kind: 'message' | 'signal', text: string) => {
     if (!session) return;
+    setNotificationNotice('');
     try {
       const response = await fetch('/api/push/notify', {
         method: 'POST',
@@ -994,18 +1131,25 @@ export default function Home() {
         },
         body: JSON.stringify({ kind, text }),
       });
-      const result = await response.json() as { sent?: number; reason?: string; error?: string };
+      let result: { sent?: number; reason?: string; error?: string } = {};
+      try {
+        result = await response.json() as typeof result;
+      } catch (error) {
+        console.error('Unable to read partner notification response:', error);
+      }
       if (!response.ok) throw new Error(result.error ?? 'The push service could not accept the notification.');
       if (!result.sent) {
         const reason = result.reason ?? 'No active push subscription was found.';
         setPushError(reason);
-        alert(`Your ${kind === 'message' ? 'message' : 'tap'} was saved, but no push notification was sent: ${reason}`);
+        setNotificationNotice(`Your ${kind === 'message' ? 'message' : 'tap'} was saved, but no push notification was sent: ${reason}`);
+      } else {
+        setPushError('');
       }
     } catch (error) {
       console.error('Unable to notify your partner:', error);
       const message = error instanceof Error ? error.message : 'Push notification failed.';
       setPushError(message);
-      alert(`Your ${kind === 'message' ? 'message' : 'tap'} was saved, but the notification failed: ${message}`);
+      setNotificationNotice(`Your ${kind === 'message' ? 'message' : 'tap'} was saved, but the notification failed: ${message}`);
     }
   };
 
@@ -1545,6 +1689,11 @@ export default function Home() {
             {sharedDataWarning}
           </p>
         )}
+        {notificationNotice && (
+          <p role="status" aria-live="polite" className="absolute top-14 left-3 right-3 z-30 rounded-lg border border-pink-500/25 bg-[#101625]/95 px-3 py-2 text-center text-[10px] text-pink-100 shadow-lg">
+            {notificationNotice}
+          </p>
+        )}
         
         {/* TAB 1: TAPS */}
         {activeTab === 'taps' && (
@@ -1720,7 +1869,7 @@ export default function Home() {
                 <p className="text-xs font-bold text-pink-400">📍 {distanceKm}</p>
               </div>
               <div className="text-right">
-                <p className="text-[10px] text-slate-400 font-medium">Sweden Local Time</p>
+                <p className="text-[10px] text-slate-400 font-medium">Partner&apos;s Local Time</p>
                 <p className="text-xs font-bold text-purple-400">🕒 {partnerLocalTime || 'Loading...'}</p>
               </div>
             </div>
@@ -1752,7 +1901,7 @@ export default function Home() {
               {!isPaired && <p className="text-[10px] text-amber-300">Pair your account first.</p>}
               {locationError && <p role="alert" className="text-[10px] text-rose-300">{locationError}</p>}
               <p className="text-[10px] text-slate-500">
-                Exact GPS is visible only to your paired account. PWA sharing pauses when Chrome suspends or closes Heartlink; old locations are hidden after 2 minutes.
+                Both partners must opt in separately. The local clock uses the partner&apos;s phone time zone; exact GPS is visible only to your paired account while Heartlink is open, and expires after 2 minutes.
               </p>
             </div>
 

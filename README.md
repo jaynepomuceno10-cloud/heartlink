@@ -28,6 +28,9 @@ closed; locations older than two minutes are hidden from the partner.
 The live data subscription retries with capped exponential backoff after connection errors,
 reconnects promptly when the device comes back online, and shows its status without blocking
 the app with browser alerts.
+Both partners must enable location sharing separately. The location screen displays the
+partner's local clock using the time zone reported by their device; the partner must share
+location for that time zone to be available.
 
 Push notifications are sent through the Next.js API and require these environment variables
 in local development and Vercel Production:
@@ -41,6 +44,11 @@ Generate a VAPID key pair with `npx web-push generate-vapid-keys`, then configur
 key, private key, and subject. The existing Supabase URL and anon key are also needed by the
 app. Each partner must sign in, pair, and enable notifications on each device in Heartlink
 Settings. Push delivery requires internet access and browser notification permission.
+If push setup or delivery fails, first run both SQL scripts in the order above, verify the
+VAPID and Supabase environment variables are set for the deployed Vercel environment, and
+redeploy. Then have the receiving partner open Heartlink, allow notifications, and enable
+them in Settings. A PWA can receive Web Push while minimized/closed, but actions such as
+sending a tap must be initiated while the sender's app is open.
 The Music Sync switch is saved per account and device. When enabled, selected tracks and
 play/pause changes are shared; when disabled, playback stays local and the partner's copy
 of shared playback is paused when Sync is turned off. Browser autoplay policies may require

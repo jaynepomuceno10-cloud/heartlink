@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import webPush from "web-push";
-import { authenticateRequest, getUserCouple } from "@/lib/supabase-admin";
+import { authenticateRequest, explainPushBackendError, getUserCouple } from "@/lib/supabase-admin";
 
 interface PushNotificationInput {
   kind?: unknown;
@@ -19,7 +19,9 @@ export async function POST(request: Request) {
     const privateKey = process.env.VAPID_PRIVATE_KEY;
     const subject = process.env.VAPID_SUBJECT;
     if (!publicKey || !privateKey || !subject) {
-      return NextResponse.json({ error: "Push notifications are not configured on the server." }, { status: 503 });
+      return NextResponse.json({
+        error: "Push notifications are not configured in Vercel. Set NEXT_PUBLIC_VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, and VAPID_SUBJECT, then redeploy.",
+      }, { status: 503 });
     }
 
     const { user, error: authError } = await authenticateRequest(request);
@@ -48,7 +50,12 @@ export async function POST(request: Request) {
     if (error) throw error;
 
     const subscriptions = (data ?? []) as StoredSubscription[];
-    if (subscriptions.length === 0) return NextResponse.json({ sent: 0, reason: "Partner has not enabled notifications." });
+    if (subscriptions.length === 0) {
+      return NextResponse.json({
+        sent: 0,
+        reason: "Your partner needs to enable notifications on their device in Heartlink Settings.",
+      });
+    }
 
     webPush.setVapidDetails(subject, publicKey, privateKey);
     const title = body.kind === "message" ? "New Heartlink message" : "Heartlink tap";
@@ -62,7 +69,7 @@ export async function POST(request: Request) {
     const results = await Promise.all(subscriptions.map(async (subscription) => {
       try {
         await webPush.sendNotification(subscription.subscription, payload);
-        return true;
+        return { sent: true, statusCode: undefined };
       } catch (pushError) {
         const statusCode = (pushError as { statusCode?: number }).statusCode;
         if (statusCode === 404 || statusCode === 410) {
@@ -73,18 +80,22 @@ export async function POST(request: Request) {
         } else {
           console.error("Push delivery failed:", pushError);
         }
-        return false;
+        return { sent: false, statusCode, error: pushError };
       }
     }));
 
-    const sent = results.filter(Boolean).length;
+    const sent = results.filter((result) => result.sent).length;
     if (sent === 0) {
-      return NextResponse.json({ error: "Push service did not accept the notification." }, { status: 502 });
+      const failure = results.find((result) => !result.sent);
+      const reason = failure
+        ? explainPushBackendError(failure.error, "send the partner notification")
+        : "No active push subscription was found.";
+      return NextResponse.json({ error: reason }, { status: 502 });
     }
 
     return NextResponse.json({ sent, total: subscriptions.length });
   } catch (error) {
-    console.error("Unable to send partner push notification:", error);
-    return NextResponse.json({ error: "Unable to send the partner notification." }, { status: 500 });
+    const message = explainPushBackendError(error, "send the partner notification");
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
