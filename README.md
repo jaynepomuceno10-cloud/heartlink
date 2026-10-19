@@ -32,6 +32,21 @@ Both partners must enable location sharing separately. The location screen displ
 partner's local clock using the time zone reported by their device; the partner must share
 location for that time zone to be available.
 
+## Movie Watch Room
+
+The Movies tab lets paired partners upload private movie files to the shared
+`heartlink-media` bucket and sync play, pause, and seek actions in real time. Uploads use
+resumable transfers and support files up to 2 GB; either partner can delete a movie, which
+removes it for both devices.
+
+Run `supabase-sync.sql` and then `supabase-ldr-features.sql` in the Supabase SQL Editor to
+update the shared-data types and media bucket policies. In the Supabase project settings,
+also raise the global maximum upload size to 2 GB (subject to the project's plan limits).
+The SQL scripts set the bucket-level cap and allow video MIME types, but cannot override
+Supabase's project-wide upload limit. Both partners need a compatible browser video codec
+and an active connection; browser autoplay restrictions may require the receiving partner
+to tap Play once.
+
 Push notifications are sent through the Next.js API and require these environment variables
 in local development and Vercel Production:
 

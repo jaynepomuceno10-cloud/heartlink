@@ -136,7 +136,9 @@ create table if not exists public.couple_app_data (
       'settings',
       'wallpaper',
       'relationship',
-      'playback'
+      'playback',
+      'movie',
+      'movie_playback'
     )
   ),
   item_id text not null,
@@ -200,8 +202,8 @@ values (
   'heartlink-media',
   'heartlink-media',
   false,
-  52428800,
-  array['image/*', 'audio/*']
+  2147483648,
+  array['image/*', 'audio/*', 'video/*']
 )
 on conflict (id) do update
 set public = false,

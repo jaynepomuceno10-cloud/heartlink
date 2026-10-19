@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 import type { Session } from '@supabase/supabase-js';
+import { Upload } from 'tus-js-client';
 import { supabase } from '../lib/supabase';
 
 interface Song {
@@ -9,6 +10,22 @@ interface Song {
   title: string;
   url: string;
   storagePath?: string;
+}
+
+interface Movie {
+  id: string;
+  title: string;
+  url: string;
+  storagePath: string;
+  size: number;
+}
+
+interface MoviePlayback {
+  movieId: string;
+  currentTime: number;
+  isPlaying: boolean;
+  userId: string;
+  timestamp: number;
 }
 
 interface Post {
@@ -44,6 +61,8 @@ type SharedDataType =
   | 'wallpaper'
   | 'relationship'
   | 'playback'
+  | 'movie'
+  | 'movie_playback'
   | 'location';
 
 interface SharedRecord {
@@ -106,6 +125,7 @@ interface LeafletRuntime {
 }
 
 const LOCATION_MAX_AGE_MS = 2 * 60 * 1000;
+const MAX_MOVIE_SIZE_BYTES = 2 * 1024 * 1024 * 1024;
 
 function isLocationFresh(location: SharedLocation | null, now: number) {
   if (!location || now < location.updatedAt) return false;
@@ -199,6 +219,16 @@ export default function Home() {
   const [musicError, setMusicError] = useState('');
   const audioRef = useRef<HTMLAudioElement>(null);
   const musicInputRef = useRef<HTMLInputElement>(null);
+  const [movies, setMovies] = useState<Movie[]>([]);
+  const [currentMovie, setCurrentMovie] = useState<Movie | null>(null);
+  const [moviePlayback, setMoviePlayback] = useState<MoviePlayback | null>(null);
+  const [movieUploadProgress, setMovieUploadProgress] = useState<number | null>(null);
+  const [movieError, setMovieError] = useState('');
+  const movieInputRef = useRef<HTMLInputElement>(null);
+  const movieVideoRef = useRef<HTMLVideoElement>(null);
+  const lastAppliedMoviePlaybackRef = useRef<number | null>(null);
+  const lastMoviePositionSyncRef = useRef(0);
+  const isApplyingMoviePlaybackRef = useRef(false);
 
   // Schedule & Milestones States
   const [schedules, setSchedules] = useState<ScheduleItem[]>([]);
@@ -257,6 +287,35 @@ export default function Home() {
     });
     return true;
   }, []);
+
+  const applyMoviePlayback = useCallback(() => {
+    const video = movieVideoRef.current;
+    if (!video || !currentMovie || !moviePlayback || moviePlayback.movieId !== currentMovie.id
+      || video.readyState < HTMLMediaElement.HAVE_METADATA
+      || lastAppliedMoviePlaybackRef.current === moviePlayback.timestamp
+      || (moviePlayback.userId === session?.user?.id && lastAppliedMoviePlaybackRef.current !== null)) {
+      return;
+    }
+
+    lastAppliedMoviePlaybackRef.current = moviePlayback.timestamp;
+    isApplyingMoviePlaybackRef.current = true;
+    const duration = Number.isFinite(video.duration) ? video.duration : Number.POSITIVE_INFINITY;
+    const targetTime = Math.min(Math.max(moviePlayback.currentTime, 0), duration);
+    if (Number.isFinite(targetTime) && Math.abs(video.currentTime - targetTime) > 1.5) {
+      video.currentTime = targetTime;
+    }
+    if (moviePlayback.isPlaying) {
+      void video.play().catch((error: unknown) => {
+        console.error('Unable to start synchronized movie playback:', error);
+        setMovieError('Your browser blocked synchronized playback. Tap Play to start the movie on this device.');
+      });
+    } else {
+      video.pause();
+    }
+    window.setTimeout(() => {
+      isApplyingMoviePlaybackRef.current = false;
+    }, 1000);
+  }, [currentMovie, moviePlayback, session?.user?.id]);
 
   const distanceKm = (() => {
     if (!ownLocation
@@ -335,6 +394,72 @@ export default function Home() {
     } catch (urlError) {
       const { error: cleanupError } = await supabase.storage.from('heartlink-media').remove([path]);
       if (cleanupError) console.error('Unable to remove uploaded media after signing failed:', cleanupError);
+      throw urlError;
+    }
+  };
+
+  const uploadMovieFile = async (
+    file: File,
+    itemId: string,
+    onProgress: (percentage: number) => void,
+  ) => {
+    if (!myCoupleCode) throw new Error('Pair your account before uploading shared movies.');
+
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    if (!supabaseUrl || !anonKey) {
+      throw new Error('Supabase is not configured for movie uploads.');
+    }
+
+    const { data: { session: currentSession }, error: sessionError } = await supabase.auth.getSession();
+    if (sessionError) throw sessionError;
+    if (!currentSession?.access_token) throw new Error('Sign in again before uploading a movie.');
+
+    const extension = file.name.match(/\.[a-z0-9]{1,8}$/i)?.[0] ?? '';
+    const path = `${myCoupleCode}/movies/${itemId}${extension}`;
+    const projectUrl = new URL(supabaseUrl);
+    const storageHost = projectUrl.hostname.endsWith('.supabase.co')
+      ? projectUrl.hostname.replace(/\.supabase\.co$/, '.storage.supabase.co')
+      : projectUrl.host;
+    const endpoint = `${projectUrl.protocol}//${storageHost}/storage/v1/upload/resumable`;
+
+    await new Promise<void>((resolve, reject) => {
+      const upload = new Upload(file, {
+        endpoint,
+        retryDelays: [0, 3000, 5000, 10000, 20000],
+        headers: {
+          authorization: `Bearer ${currentSession.access_token}`,
+          apikey: anonKey,
+          'x-upsert': 'false',
+        },
+        uploadDataDuringCreation: true,
+        removeFingerprintOnSuccess: true,
+        chunkSize: 6 * 1024 * 1024,
+        fingerprint: async () => `${endpoint}:${path}`,
+        metadata: {
+          bucketName: 'heartlink-media',
+          objectName: path,
+          contentType: file.type,
+          cacheControl: '3600',
+        },
+        onProgress: (bytesSent, bytesTotal) => {
+          onProgress(Math.round((bytesSent / bytesTotal) * 100));
+        },
+        onError: reject,
+        onSuccess: () => resolve(),
+      });
+
+      void upload.findPreviousUploads().then((previousUploads) => {
+        if (previousUploads.length > 0) upload.resumeFromPreviousUpload(previousUploads[0]);
+        upload.start();
+      }).catch(reject);
+    });
+
+    try {
+      return { path, url: await getSharedMediaUrl(path) };
+    } catch (urlError) {
+      const { error: cleanupError } = await supabase.storage.from('heartlink-media').remove([path]);
+      if (cleanupError) console.error('Unable to remove uploaded movie after signing failed:', cleanupError);
       throw urlError;
     }
   };
@@ -431,6 +556,29 @@ export default function Home() {
       audioRef.current.pause();
     }
   }, [currentSong, isPlaying, startAudioPlayback]);
+
+  useEffect(() => {
+    const video = movieVideoRef.current;
+    if (activeTab !== 'movies' || !video) return;
+    if (!currentMovie) {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+      return;
+    }
+    if (video.getAttribute('src') !== currentMovie.url) {
+      isApplyingMoviePlaybackRef.current = true;
+      video.src = currentMovie.url;
+      video.load();
+      window.setTimeout(() => {
+        isApplyingMoviePlaybackRef.current = false;
+      }, 1000);
+    }
+  }, [activeTab, currentMovie]);
+
+  useEffect(() => {
+    if (activeTab === 'movies') applyMoviePlayback();
+  }, [activeTab, applyMoviePlayback]);
 
   useEffect(() => {
     if (activeTab !== 'location' || !mapContainerRef.current) return;
@@ -815,6 +963,19 @@ export default function Home() {
             };
           }));
 
+        const storedMovies = await Promise.all(records
+          .filter((record) => record.data_type === 'movie')
+          .map(async (record): Promise<Movie> => {
+            const storagePath = String(record.payload.storagePath ?? '');
+            return {
+              id: record.item_id,
+              title: String(record.payload.title ?? ''),
+              url: storagePath ? await getSharedMediaUrl(storagePath) : '',
+              storagePath,
+              size: Number(record.payload.size ?? 0),
+            };
+          }));
+
         const settings = records.find((record) => record.data_type === 'settings')?.payload;
         const musicSyncPreferenceKey = `heartlink:music-sync:${session.user.id}`;
         const localMusicSyncPreference = window.localStorage.getItem(musicSyncPreferenceKey);
@@ -838,6 +999,23 @@ export default function Home() {
         const relationship = records.find((record) => record.data_type === 'relationship')?.payload;
         const playback = records.find((record) => record.data_type === 'playback')?.payload;
         const playingSong = storedSongs.find((song) => song.id === playback?.songId) ?? null;
+        const storedMoviePlayback = records.find((record) => record.data_type === 'movie_playback');
+        const moviePlaybackPayload = storedMoviePlayback?.payload;
+        const storedMoviePlaybackTimestamp = storedMoviePlayback
+          ? Date.parse(storedMoviePlayback.updated_at)
+          : 0;
+        const payloadMovieTime = Number(moviePlaybackPayload?.currentTime ?? 0);
+        const payloadMovieTimestamp = Number(moviePlaybackPayload?.timestamp ?? storedMoviePlaybackTimestamp);
+        const parsedMoviePlayback = typeof moviePlaybackPayload?.movieId === 'string'
+          ? {
+            movieId: moviePlaybackPayload.movieId,
+            currentTime: Number.isFinite(payloadMovieTime) ? Math.max(0, payloadMovieTime) : 0,
+            isPlaying: Boolean(moviePlaybackPayload.isPlaying),
+            userId: String(moviePlaybackPayload.user_id ?? ''),
+            timestamp: Number.isFinite(payloadMovieTimestamp) ? payloadMovieTimestamp : storedMoviePlaybackTimestamp,
+          }
+          : null;
+        const playingMovie = storedMovies.find((movie) => movie.id === parsedMoviePlayback?.movieId) ?? null;
 
         if (!isActive || loadId !== latestLoad) return;
         loadRetryCount = 0;
@@ -848,6 +1026,9 @@ export default function Home() {
         setPartnerLocation(partnerPosition);
         setPosts(storedPosts.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)));
         setPlaylist(storedSongs);
+        setMovies(storedMovies);
+        setCurrentMovie(playingMovie);
+        setMoviePlayback(parsedMoviePlayback);
         if (settings?.tapMeanings && typeof settings.tapMeanings === 'object') {
           setTapMeanings(settings.tapMeanings as typeof tapMeanings);
           setTempMeanings(settings.tapMeanings as typeof tapMeanings);
@@ -1436,6 +1617,159 @@ export default function Home() {
         if (cleanupError) console.error('Unable to remove audio media after save failed:', cleanupError);
       }
       reportSyncError('save the audio file', error);
+    }
+  };
+
+  const handleMovieUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.currentTarget.files?.[0];
+    if (!file) return;
+    setMovieError('');
+    if (!isPaired || !session) {
+      setMovieError('Pair your account before uploading movies.');
+      e.currentTarget.value = '';
+      return;
+    }
+    if (!file.type.startsWith('video/')) {
+      setMovieError('Choose a supported video file.');
+      e.currentTarget.value = '';
+      return;
+    }
+    if (file.size > MAX_MOVIE_SIZE_BYTES) {
+      setMovieError('Movie files must be 2 GB or smaller.');
+      e.currentTarget.value = '';
+      return;
+    }
+
+    const id = crypto.randomUUID();
+    let uploadedPath: string | undefined;
+    let movieRecordSaved = false;
+    setMovieUploadProgress(0);
+    try {
+      const uploaded = await uploadMovieFile(file, id, setMovieUploadProgress);
+      uploadedPath = uploaded.path;
+      const movie: Movie = {
+        id,
+        title: file.name.replace(/\.[^/.]+$/, ''),
+        url: uploaded.url,
+        storagePath: uploaded.path,
+        size: file.size,
+      };
+      await saveSharedRecord('movie', id, {
+        title: movie.title,
+        storagePath: movie.storagePath,
+        size: movie.size,
+      });
+      movieRecordSaved = true;
+      const timestamp = Date.now();
+      await saveSharedRecord('movie_playback', 'current', {
+        movieId: id,
+        currentTime: 0,
+        isPlaying: false,
+        user_id: session.user.id,
+        timestamp,
+      });
+      setMovies((previous) => [...previous.filter((item) => item.id !== id), movie]);
+      setCurrentMovie(movie);
+      setMoviePlayback({
+        movieId: id,
+        currentTime: 0,
+        isPlaying: false,
+        userId: session.user.id,
+        timestamp,
+      });
+      setMovieError('');
+      if (movieInputRef.current) movieInputRef.current.value = '';
+    } catch (error) {
+      if (movieRecordSaved) {
+        try {
+          await deleteSharedRecord('movie', id);
+        } catch (cleanupError) {
+          console.error('Unable to remove movie metadata after upload failed:', cleanupError);
+        }
+      }
+      if (uploadedPath) {
+        const { error: cleanupError } = await supabase.storage.from('heartlink-media').remove([uploadedPath]);
+        if (cleanupError) console.error('Unable to remove uploaded movie after saving failed:', cleanupError);
+      }
+      console.error('Unable to upload a shared movie:', error);
+      setMovieError(error instanceof Error ? error.message : 'Could not upload this movie.');
+    } finally {
+      setMovieUploadProgress(null);
+      if (movieInputRef.current) movieInputRef.current.value = '';
+    }
+  };
+
+  const saveMoviePlayback = async (isPlayingMovie: boolean, currentTime: number) => {
+    if (!currentMovie || !session) return;
+    const timestamp = Math.max(Date.now(), (moviePlayback?.timestamp ?? 0) + 1);
+    lastMoviePositionSyncRef.current = Date.now();
+    try {
+      await saveSharedRecord('movie_playback', 'current', {
+        movieId: currentMovie.id,
+        currentTime: Math.max(0, currentTime),
+        isPlaying: isPlayingMovie,
+        user_id: session.user.id,
+        timestamp,
+      });
+    } catch (error) {
+      console.error('Unable to sync movie playback:', error);
+      setMovieError(error instanceof Error ? error.message : 'Could not sync movie playback.');
+    }
+  };
+
+  const handleMoviePlay = () => {
+    if (!isApplyingMoviePlaybackRef.current && movieVideoRef.current) {
+      void saveMoviePlayback(true, movieVideoRef.current.currentTime);
+    }
+  };
+
+  const handleMoviePause = () => {
+    if (!isApplyingMoviePlaybackRef.current && movieVideoRef.current) {
+      void saveMoviePlayback(false, movieVideoRef.current.currentTime);
+    }
+  };
+
+  const handleMovieSeeked = () => {
+    if (!isApplyingMoviePlaybackRef.current && movieVideoRef.current) {
+      void saveMoviePlayback(!movieVideoRef.current.paused, movieVideoRef.current.currentTime);
+    }
+  };
+
+  const handleMovieTimeUpdate = () => {
+    const video = movieVideoRef.current;
+    if (!video || video.paused || isApplyingMoviePlaybackRef.current
+      || moviePlayback?.userId !== session?.user?.id
+      || Date.now() - lastMoviePositionSyncRef.current < 10_000) {
+      return;
+    }
+    void saveMoviePlayback(true, video.currentTime);
+  };
+
+  const handleDeleteMovie = async (movieId: string) => {
+    const movie = movies.find((item) => item.id === movieId);
+    if (!movie) return;
+    if (!window.confirm(`Delete "${movie.title}" for both of you? This cannot be undone.`)) return;
+
+    setMovieError('');
+    try {
+      const { error } = await supabase.storage.from('heartlink-media').remove([movie.storagePath]);
+      if (error) throw error;
+      if (currentMovie?.id === movieId) {
+        isApplyingMoviePlaybackRef.current = true;
+        movieVideoRef.current?.pause();
+        setCurrentMovie(null);
+        setMoviePlayback(null);
+        window.setTimeout(() => {
+          isApplyingMoviePlaybackRef.current = false;
+        }, 1000);
+        await deleteSharedRecord('movie_playback', 'current');
+      }
+      await deleteSharedRecord('movie', movieId);
+      signedUrlCacheRef.current.delete(movie.storagePath);
+      setMovies((previous) => previous.filter((item) => item.id !== movieId));
+    } catch (error) {
+      console.error('Unable to delete shared movie:', error);
+      setMovieError(error instanceof Error ? error.message : 'Could not delete this movie.');
     }
   };
 
@@ -2034,7 +2368,132 @@ export default function Home() {
           </div>
         )}
 
-        {/* TAB 6: SCHEDULE & MILESTONES */}
+        {/* TAB 6: MOVIE WATCH ROOM */}
+        {activeTab === 'movies' && (
+          <div className="absolute inset-0 flex flex-col p-4 overflow-y-auto space-y-3">
+            <div className="shrink-0 rounded-2xl border border-slate-800 bg-[#101625]/90 p-3">
+              <p className="text-xs font-bold text-pink-400">🎬 Movie Watch Room</p>
+              <p className="mt-1 text-[10px] text-slate-400">
+                Upload a movie once, then watch together. Play, pause, and seeking sync between your devices.
+              </p>
+            </div>
+
+            <div className="shrink-0 overflow-hidden rounded-2xl border border-slate-800 bg-black">
+              {currentMovie ? (
+                <video
+                  ref={movieVideoRef}
+                  controls
+                  playsInline
+                  preload="metadata"
+                  onLoadedMetadata={applyMoviePlayback}
+                  onPlay={handleMoviePlay}
+                  onPause={handleMoviePause}
+                  onSeeked={handleMovieSeeked}
+                  onTimeUpdate={handleMovieTimeUpdate}
+                  onError={() => setMovieError('Could not play this movie. Check its format and your connection.')}
+                  className="aspect-video w-full bg-black"
+                />
+              ) : (
+                <div className="flex aspect-video items-center justify-center px-6 text-center text-xs text-slate-500">
+                  Choose an uploaded movie to start watching.
+                </div>
+              )}
+            </div>
+
+            {movieError && <p role="alert" className="shrink-0 text-[10px] text-rose-300">{movieError}</p>}
+
+            <div className="min-h-0 flex-1 space-y-2">
+              <h3 className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                Shared movies ({movies.length})
+              </h3>
+              {movies.length === 0 ? (
+                <p className="py-4 text-center text-xs italic text-slate-500">No movies uploaded yet.</p>
+              ) : (
+                movies.map((movie) => (
+                  <div
+                    key={movie.id}
+                    className={`flex items-center justify-between gap-2 rounded-xl border p-3 ${
+                      currentMovie?.id === movie.id ? 'border-pink-500/70 bg-pink-500/5' : 'border-slate-800 bg-[#101625]/90'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMovieError('');
+                        setCurrentMovie(movie);
+                        if (moviePlayback?.movieId !== movie.id) {
+                          const timestamp = Math.max(Date.now(), (moviePlayback?.timestamp ?? 0) + 1);
+                          setMoviePlayback({
+                            movieId: movie.id,
+                            currentTime: 0,
+                            isPlaying: false,
+                            userId: session?.user?.id ?? '',
+                            timestamp,
+                          });
+                          void saveSharedRecord('movie_playback', 'current', {
+                            movieId: movie.id,
+                            currentTime: 0,
+                            isPlaying: false,
+                            user_id: session?.user?.id,
+                            timestamp,
+                          }).catch((error: unknown) => {
+                            console.error('Unable to select a shared movie:', error);
+                            setMovieError('Could not sync the selected movie.');
+                          });
+                        }
+                      }}
+                      className="min-w-0 flex-1 text-left"
+                    >
+                      <span className="block truncate text-xs font-semibold text-white">{movie.title}</span>
+                      <span className="mt-1 block text-[10px] text-slate-500">
+                        {movie.size > 0 ? `${(movie.size / (1024 * 1024)).toFixed(0)} MB` : 'Movie file'}
+                        {currentMovie?.id === movie.id ? ' · Selected' : ''}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleDeleteMovie(movie.id)}
+                      className="shrink-0 rounded-lg px-2 py-1 text-[10px] font-semibold text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-300"
+                      title="Delete this movie for both partners"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="shrink-0 space-y-2 rounded-2xl border border-slate-800 bg-[#101625]/90 p-3">
+              <label htmlFor="movie-upload" className="block text-[11px] font-semibold text-slate-300">
+                Upload a movie (up to 2 GB)
+              </label>
+              <input
+                id="movie-upload"
+                ref={movieInputRef}
+                type="file"
+                accept="video/*"
+                disabled={movieUploadProgress !== null || !isPaired}
+                onChange={(event) => void handleMovieUpload(event)}
+                className="w-full text-[10px] text-slate-400 file:mr-2 file:rounded-xl file:border-0 file:bg-pink-600 file:px-3 file:py-1.5 file:text-[10px] file:font-semibold file:text-white disabled:opacity-50"
+              />
+              {movieUploadProgress !== null && (
+                <div className="space-y-1" role="status" aria-live="polite">
+                  <div className="flex justify-between text-[10px] text-slate-400">
+                    <span>Uploading movie…</span>
+                    <span>{movieUploadProgress}%</span>
+                  </div>
+                  <progress value={movieUploadProgress} max="100" className="h-1.5 w-full accent-pink-500" />
+                </div>
+              )}
+              {!isPaired && <p className="text-[10px] text-amber-300">Pair your account before uploading movies.</p>}
+              <p className="text-[10px] text-slate-500">
+                Movie files are shared privately with your partner. Deleting a movie removes it for both devices.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* TAB 7: SCHEDULE & MILESTONES */}
         {activeTab === 'schedule' && (
           <div className="absolute inset-0 flex flex-col p-4 overflow-y-auto space-y-3">
             <div className="p-4 bg-gradient-to-br from-rose-950/80 to-[#101625] border border-rose-500/30 rounded-2xl shadow-md shrink-0">
@@ -2340,7 +2799,7 @@ export default function Home() {
         </div>
       )}
 
-      {/* 3. FIXED BOTTOM NAVIGATION BAR (6 TABS) */}
+      {/* 3. FIXED BOTTOM NAVIGATION BAR (7 TABS) */}
       <div className="w-full bg-[#101625]/90 backdrop-blur-md border-t border-slate-800 py-2 px-3 flex justify-between items-center z-20 shrink-0 h-16 shadow-2xl">
         <button
           onClick={() => setActiveTab('taps')}
@@ -2380,6 +2839,14 @@ export default function Home() {
         >
           <span className="text-base">🎵</span>
           <span className="text-[9px] font-semibold">Music</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('movies')}
+          className={`flex flex-col items-center gap-1 transition cursor-pointer ${activeTab === 'movies' ? 'text-pink-500 scale-105' : 'text-slate-400'}`}
+        >
+          <span className="text-base">🎬</span>
+          <span className="text-[9px] font-semibold">Movies</span>
         </button>
 
         <button

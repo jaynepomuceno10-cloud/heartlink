@@ -33,6 +33,8 @@ alter table public.couple_app_data
       'wallpaper',
       'relationship',
       'playback',
+      'movie',
+      'movie_playback',
       'location'
     )
   );
@@ -114,3 +116,8 @@ create index if not exists couple_push_subscriptions_recipient_idx
 alter table public.couple_push_subscriptions enable row level security;
 revoke all on public.couple_push_subscriptions from anon, authenticated;
 grant all on public.couple_push_subscriptions to service_role;
+
+update storage.buckets
+set file_size_limit = 2147483648,
+    allowed_mime_types = array['image/*', 'audio/*', 'video/*']
+where id = 'heartlink-media';
