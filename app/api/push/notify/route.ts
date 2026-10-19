@@ -6,6 +6,7 @@ import { authenticateRequest, explainPushBackendError, getUserCouple } from "@/l
 interface PushNotificationInput {
   kind?: unknown;
   text?: unknown;
+  hapticType?: unknown;
 }
 
 interface StoredSubscription {
@@ -31,7 +32,12 @@ export async function POST(request: Request) {
     if ((body.kind !== "message" && body.kind !== "signal")
       || typeof body.text !== "string"
       || !body.text.trim()
-      || body.text.length > 500) {
+      || body.text.length > 500
+      || (body.hapticType !== undefined
+        && body.hapticType !== "MISS_YOU"
+        && body.hapticType !== "NEED_YOU"
+        && body.hapticType !== "LOVE_YOU"
+        && body.hapticType !== "SORRY")) {
       return NextResponse.json({ error: "Invalid notification content." }, { status: 400 });
     }
 
@@ -64,6 +70,7 @@ export async function POST(request: Request) {
       body: body.text.trim().slice(0, 180),
       url: "/",
       tag: `heartlink-${body.kind}-${randomUUID()}`,
+      hapticType: body.kind === "signal" ? body.hapticType : undefined,
     });
 
     const results = await Promise.all(subscriptions.map(async (subscription) => {

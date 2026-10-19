@@ -1159,7 +1159,7 @@ export default function Home() {
     }
   };
 
-  const notifyPartner = async (kind: 'message' | 'signal', text: string) => {
+  const notifyPartner = async (kind: 'message' | 'signal', text: string, hapticType?: string) => {
     if (!session) return;
     try {
       const response = await fetch('/api/push/notify', {
@@ -1168,7 +1168,7 @@ export default function Home() {
           Authorization: `Bearer ${session.access_token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ kind, text }),
+        body: JSON.stringify({ kind, text, hapticType }),
       });
       let result: { sent?: number; reason?: string; error?: string } = {};
       try {
@@ -1292,7 +1292,7 @@ export default function Home() {
       setMessages((prev) => prev.some((item) => item.id === id)
         ? prev
         : [...prev, { id, sender: 'You', text: message, timestamp }]);
-      void notifyPartner('signal', message);
+      void notifyPartner('signal', message, hapticType);
     } catch (error) {
       reportSyncError('save your tap signal', error);
     }

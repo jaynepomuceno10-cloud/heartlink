@@ -40,6 +40,17 @@ self.addEventListener("push", (event) => {
     console.error("Unable to parse Heartlink push notification:", error);
   }
 
+  if (!notification || typeof notification !== "object" || Array.isArray(notification)) {
+    notification = {};
+  }
+
+  const hapticPatterns = {
+    MISS_YOU: [200],
+    NEED_YOU: [150, 100, 150],
+    LOVE_YOU: [100, 80, 100, 80, 300],
+    SORRY: [500, 200, 500, 200, 500],
+  };
+  const vibrate = hapticPatterns[notification.hapticType] || [200, 100, 200];
   const title = typeof notification.title === "string" ? notification.title : "Heartlink";
   const options = {
     body: typeof notification.body === "string" ? notification.body : "Your partner sent you a Heartlink update.",
@@ -47,7 +58,7 @@ self.addEventListener("push", (event) => {
     badge: "/heartlink-icon-192.png",
     tag: typeof notification.tag === "string" ? notification.tag : "heartlink-update",
     data: { url: typeof notification.url === "string" ? notification.url : "/" },
-    vibrate: [200, 100, 200],
+    vibrate,
   };
 
   event.waitUntil(self.registration.showNotification(title, options));

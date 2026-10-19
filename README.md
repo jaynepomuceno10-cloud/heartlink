@@ -51,8 +51,10 @@ Function settings; notification delivery uses the Next.js `/api/push` routes.
 If push setup or delivery fails, first run both SQL scripts in the order above, verify the
 VAPID and Supabase environment variables are set for the deployed Vercel environment, and
 redeploy. Then have the receiving partner open Heartlink, allow notifications, and enable
-them in Settings. A PWA can receive Web Push while minimized/closed, but actions such as
-sending a tap must be initiated while the sender's app is open.
+them in Settings. A PWA can receive Web Push while minimized/closed; delivery and vibration
+still depend on browser support, OS notification settings, and an active internet connection.
+Actions such as sending a tap must be initiated while the sender's app is open. Tap alerts use
+the selected signal's haptic pattern when the receiving device supports notification vibration.
 The Music Sync switch is saved per account and device. When enabled, selected tracks and
 play/pause changes are shared; when disabled, playback stays local and the partner's copy
 of shared playback is paused when Sync is turned off. Browser autoplay policies may require
