@@ -1397,6 +1397,7 @@ export default function Home() {
     try {
       const response = await fetch('/api/push/notify', {
         method: 'POST',
+        keepalive: true,
         headers: {
           Authorization: `Bearer ${session.access_token}`,
           'Content-Type': 'application/json',
@@ -2742,7 +2743,7 @@ export default function Home() {
               )}
               {pushError && <p role="alert" className="text-[10px] text-rose-300">{pushError}</p>}
               <p className="text-[10px] text-slate-500">
-                Each partner must enable notifications on their own device. Delivery requires internet and browser notification permission.
+                Each partner must enable notifications on their own device. The receiving device can be minimized or closed, but needs internet and notification permission. On iPhone or iPad, install Heartlink to the Home Screen first (iOS 16.4+); vibration patterns depend on device support.
               </p>
             </div>
 

@@ -71,8 +71,10 @@ VAPID and Supabase environment variables are set for the deployed Vercel environ
 redeploy. Then have the receiving partner open Heartlink, allow notifications, and enable
 them in Settings. A PWA can receive Web Push while minimized/closed; delivery and vibration
 still depend on browser support, OS notification settings, and an active internet connection.
-Actions such as sending a tap must be initiated while the sender's app is open. Tap alerts use
-the selected signal's haptic pattern when the receiving device supports notification vibration.
+On iPhone and iPad, install Heartlink to the Home Screen and use iOS/iPadOS 16.4 or newer;
+regular browser tabs do not receive Web Push there. Actions such as sending a tap must be
+initiated while the sender's app is open. Tap alerts use the selected signal's haptic pattern
+when the receiving device supports notification vibration; iOS controls vibration behavior.
 The Music Sync switch is saved per account and device. When enabled, selected tracks and
 play/pause changes are shared; when disabled, playback stays local and the partner's copy
 of shared playback is paused when Sync is turned off. Browser autoplay policies may require
