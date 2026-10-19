@@ -161,6 +161,9 @@ function getMovieUploadErrorMessage(error: unknown) {
   if (status === 401 || status === 403) {
     return `Supabase denied the movie upload. Confirm you are signed in, paired, and the bucket upload policy is installed. ${diagnostic}`;
   }
+  if (/couple_app_data_data_type_check|violates check constraint/i.test(diagnostic)) {
+    return 'The movie file uploaded, but Supabase rejected its shared movie record because the database schema is outdated. Run supabase-movie-upload-fix.sql in this project’s Supabase SQL Editor, confirm the result includes movie and movie_playback, then retry.';
+  }
   if (status === 0 || /fetch failed|networkerror|failed to fetch/i.test(diagnostic)) {
     return 'The upload connection failed. Check your internet connection and retry; resumable uploads will continue from saved progress where possible.';
   }
