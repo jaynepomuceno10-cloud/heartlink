@@ -40,7 +40,9 @@ resumable transfers and support files up to 2 GB; either partner can delete a mo
 removes it for both devices.
 
 Run `supabase-sync.sql` and then `supabase-ldr-features.sql` in the Supabase SQL Editor to
-update the shared-data types and media bucket policies. In the Supabase project settings,
+update the shared-data types and media bucket policies, including explicit MP4 (`video/mp4`)
+support. If an upload returns a MIME type 415 error, rerun both scripts in this order so
+the existing bucket's allowed MIME types are updated. In the Supabase project settings,
 also raise the global maximum upload size to 2 GB (subject to the project's plan limits).
 The SQL scripts set the bucket-level cap and allow video MIME types, but cannot override
 Supabase's project-wide upload limit. Both partners need a compatible browser video codec

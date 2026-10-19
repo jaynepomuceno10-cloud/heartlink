@@ -119,5 +119,5 @@ grant all on public.couple_push_subscriptions to service_role;
 
 update storage.buckets
 set file_size_limit = 2147483648,
-    allowed_mime_types = array['image/*', 'audio/*', 'video/*']
+    allowed_mime_types = array['image/*', 'audio/*', 'video/*', 'video/mp4']
 where id = 'heartlink-media';

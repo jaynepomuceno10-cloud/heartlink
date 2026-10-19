@@ -127,6 +127,11 @@ interface LeafletRuntime {
 const LOCATION_MAX_AGE_MS = 2 * 60 * 1000;
 const MAX_MOVIE_SIZE_BYTES = 2 * 1024 * 1024 * 1024;
 
+function getMovieContentType(file: File) {
+  if (/\.mp4$/i.test(file.name)) return 'video/mp4';
+  return file.type;
+}
+
 function isLocationFresh(location: SharedLocation | null, now: number) {
   if (!location || now < location.updatedAt) return false;
   return now - location.updatedAt < LOCATION_MAX_AGE_MS;
@@ -417,6 +422,7 @@ export default function Home() {
 
     const extension = file.name.match(/\.[a-z0-9]{1,8}$/i)?.[0] ?? '';
     const path = `${myCoupleCode}/movies/${itemId}${extension}`;
+    const contentType = getMovieContentType(file);
     const projectUrl = new URL(supabaseUrl);
     const storageHost = projectUrl.hostname.endsWith('.supabase.co')
       ? projectUrl.hostname.replace(/\.supabase\.co$/, '.storage.supabase.co')
@@ -439,7 +445,7 @@ export default function Home() {
         metadata: {
           bucketName: 'heartlink-media',
           objectName: path,
-          contentType: file.type,
+          contentType,
           cacheControl: '3600',
         },
         onProgress: (bytesSent, bytesTotal) => {
@@ -1629,7 +1635,7 @@ export default function Home() {
       e.currentTarget.value = '';
       return;
     }
-    if (!file.type.startsWith('video/')) {
+    if (!file.type.startsWith('video/') && !/\.mp4$/i.test(file.name)) {
       setMovieError('Choose a supported video file.');
       e.currentTarget.value = '';
       return;
@@ -1692,7 +1698,10 @@ export default function Home() {
         if (cleanupError) console.error('Unable to remove uploaded movie after saving failed:', cleanupError);
       }
       console.error('Unable to upload a shared movie:', error);
-      setMovieError(error instanceof Error ? error.message : 'Could not upload this movie.');
+      const message = error instanceof Error ? error.message : '';
+      setMovieError(/response code:\s*415|mime type video\/mp4 is not supported/i.test(message)
+        ? 'Supabase is rejecting MP4 uploads. Run the updated supabase-sync.sql and supabase-ldr-features.sql scripts in order, then try again.'
+        : message || 'Could not upload this movie.');
     } finally {
       setMovieUploadProgress(null);
       if (movieInputRef.current) movieInputRef.current.value = '';
@@ -2399,6 +2408,38 @@ export default function Home() {
                 </div>
               )}
             </div>
+            {currentMovie && (
+              <button
+                type="button"
+                onClick={() => {
+                  const video = movieVideoRef.current;
+                  if (!video) return;
+                  if (document.fullscreenElement) {
+                    void document.exitFullscreen().catch((error: unknown) => {
+                      console.error('Unable to exit movie fullscreen:', error);
+                      setMovieError('Could not exit fullscreen mode.');
+                    });
+                    return;
+                  }
+                  if (typeof video.requestFullscreen === 'function') {
+                    void video.requestFullscreen().catch((error: unknown) => {
+                      console.error('Unable to enter movie fullscreen:', error);
+                      setMovieError('Could not open fullscreen mode on this device.');
+                    });
+                    return;
+                  }
+                  const legacyVideo = video as HTMLVideoElement & { webkitEnterFullscreen?: () => void };
+                  if (legacyVideo.webkitEnterFullscreen) {
+                    legacyVideo.webkitEnterFullscreen();
+                  } else {
+                    setMovieError('Fullscreen mode is not supported by this browser.');
+                  }
+                }}
+                className="self-end rounded-lg border border-slate-700 px-3 py-1.5 text-[10px] font-semibold text-slate-300 transition hover:border-pink-500/60 hover:text-white"
+              >
+                Full screen
+              </button>
+            )}
 
             {movieError && <p role="alert" className="shrink-0 text-[10px] text-rose-300">{movieError}</p>}
 
@@ -2471,7 +2512,7 @@ export default function Home() {
                 id="movie-upload"
                 ref={movieInputRef}
                 type="file"
-                accept="video/*"
+                accept="video/mp4,.mp4,video/*"
                 disabled={movieUploadProgress !== null || !isPaired}
                 onChange={(event) => void handleMovieUpload(event)}
                 className="w-full text-[10px] text-slate-400 file:mr-2 file:rounded-xl file:border-0 file:bg-pink-600 file:px-3 file:py-1.5 file:text-[10px] file:font-semibold file:text-white disabled:opacity-50"

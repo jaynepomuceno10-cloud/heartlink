@@ -203,7 +203,7 @@ values (
   'heartlink-media',
   false,
   2147483648,
-  array['image/*', 'audio/*', 'video/*']
+  array['image/*', 'audio/*', 'video/*', 'video/mp4']
 )
 on conflict (id) do update
 set public = false,
