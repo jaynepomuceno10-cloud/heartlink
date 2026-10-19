@@ -48,6 +48,8 @@ The SQL scripts set the bucket-level cap and allow video MIME types, but cannot 
 Supabase's project-wide upload limit. Both partners need a compatible browser video codec
 and an active connection; browser autoplay restrictions may require the receiving partner
 to tap Play once.
+Alternatively, run `supabase-movie-upload-fix.sql` by itself to update the bucket and return
+its active configuration. Confirm the result includes `video/mp4` before retrying the upload.
 
 Push notifications are sent through the Next.js API and require these environment variables
 in local development and Vercel Production:

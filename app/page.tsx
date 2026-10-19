@@ -1700,7 +1700,7 @@ export default function Home() {
       console.error('Unable to upload a shared movie:', error);
       const message = error instanceof Error ? error.message : '';
       setMovieError(/response code:\s*415|mime type video\/mp4 is not supported/i.test(message)
-        ? 'Supabase is rejecting MP4 uploads. Run the updated supabase-sync.sql and supabase-ldr-features.sql scripts in order, then try again.'
+        ? 'Supabase is still rejecting MP4 uploads. Run supabase-movie-upload-fix.sql in the Supabase SQL Editor for this project. Confirm its result lists video/mp4 in allowed_mime_types, then retry. Also check the project-wide upload limit.'
         : message || 'Could not upload this movie.');
     } finally {
       setMovieUploadProgress(null);
