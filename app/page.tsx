@@ -132,6 +132,41 @@ function getMovieContentType(file: File) {
   return file.type;
 }
 
+function getMovieUploadErrorMessage(error: unknown) {
+  if (!error || typeof error !== 'object') return 'Could not upload this movie.';
+
+  const details = error as {
+    message?: unknown;
+    statusCode?: unknown;
+    originalResponse?: {
+      getStatus?: () => number;
+      getBody?: () => string;
+    } | null;
+  };
+  const status = typeof details.originalResponse?.getStatus === 'function'
+    ? details.originalResponse.getStatus()
+    : Number(details.statusCode);
+  const responseText = typeof details.originalResponse?.getBody === 'function'
+    ? details.originalResponse.getBody()
+    : '';
+  const message = typeof details.message === 'string' ? details.message : '';
+  const diagnostic = `${message} ${responseText}`.trim().slice(0, 400);
+
+  if (status === 415 || /mime type.+not supported/i.test(diagnostic)) {
+    return `Supabase rejected the movie's MIME type (${diagnostic || '415 Unsupported Media Type'}). In Storage → Buckets → heartlink-media → Edit bucket, clear the allowed MIME types restriction (or allow video/mp4), then save.`;
+  }
+  if (status === 413 || /file size.+exceed|payload too large/i.test(diagnostic)) {
+    return `Supabase rejected the movie because it exceeds the project's upload-size limit. Check Storage → Settings and the heartlink-media bucket limit. ${diagnostic}`;
+  }
+  if (status === 401 || status === 403) {
+    return `Supabase denied the movie upload. Confirm you are signed in, paired, and the bucket upload policy is installed. ${diagnostic}`;
+  }
+  if (status === 0 || /fetch failed|networkerror|failed to fetch/i.test(diagnostic)) {
+    return 'The upload connection failed. Check your internet connection and retry; resumable uploads will continue from saved progress where possible.';
+  }
+  return diagnostic || 'Could not upload this movie. Check the browser console for the upload error.';
+}
+
 function isLocationFresh(location: SharedLocation | null, now: number) {
   if (!location || now < location.updatedAt) return false;
   return now - location.updatedAt < LOCATION_MAX_AGE_MS;
@@ -429,37 +464,45 @@ export default function Home() {
       : projectUrl.host;
     const endpoint = `${projectUrl.protocol}//${storageHost}/storage/v1/upload/resumable`;
 
-    await new Promise<void>((resolve, reject) => {
-      const upload = new Upload(file, {
-        endpoint,
-        retryDelays: [0, 3000, 5000, 10000, 20000],
-        headers: {
-          authorization: `Bearer ${currentSession.access_token}`,
-          apikey: anonKey,
-          'x-upsert': 'false',
-        },
-        uploadDataDuringCreation: true,
-        removeFingerprintOnSuccess: true,
-        chunkSize: 6 * 1024 * 1024,
-        fingerprint: async () => `${endpoint}:${path}`,
-        metadata: {
-          bucketName: 'heartlink-media',
-          objectName: path,
-          contentType,
-          cacheControl: '3600',
-        },
-        onProgress: (bytesSent, bytesTotal) => {
-          onProgress(Math.round((bytesSent / bytesTotal) * 100));
-        },
-        onError: reject,
-        onSuccess: () => resolve(),
-      });
+    if (file.size <= 6 * 1024 * 1024) {
+      const { error } = await supabase.storage
+        .from('heartlink-media')
+        .upload(path, file, { contentType, cacheControl: '3600', upsert: false });
+      if (error) throw error;
+      onProgress(100);
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        const upload = new Upload(file, {
+          endpoint,
+          retryDelays: [0, 3000, 5000, 10000, 20000],
+          headers: {
+            authorization: `Bearer ${currentSession.access_token}`,
+            apikey: anonKey,
+            'x-upsert': 'false',
+          },
+          uploadDataDuringCreation: true,
+          removeFingerprintOnSuccess: true,
+          chunkSize: 6 * 1024 * 1024,
+          fingerprint: async () => `${endpoint}:${path}`,
+          metadata: {
+            bucketName: 'heartlink-media',
+            objectName: path,
+            contentType,
+            cacheControl: '3600',
+          },
+          onProgress: (bytesSent, bytesTotal) => {
+            onProgress(Math.round((bytesSent / bytesTotal) * 100));
+          },
+          onError: reject,
+          onSuccess: () => resolve(),
+        });
 
-      void upload.findPreviousUploads().then((previousUploads) => {
-        if (previousUploads.length > 0) upload.resumeFromPreviousUpload(previousUploads[0]);
-        upload.start();
-      }).catch(reject);
-    });
+        void upload.findPreviousUploads().then((previousUploads) => {
+          if (previousUploads.length > 0) upload.resumeFromPreviousUpload(previousUploads[0]);
+          upload.start();
+        }).catch(reject);
+      });
+    }
 
     try {
       return { path, url: await getSharedMediaUrl(path) };
@@ -1698,10 +1741,7 @@ export default function Home() {
         if (cleanupError) console.error('Unable to remove uploaded movie after saving failed:', cleanupError);
       }
       console.error('Unable to upload a shared movie:', error);
-      const message = error instanceof Error ? error.message : '';
-      setMovieError(/response code:\s*415|mime type video\/mp4 is not supported/i.test(message)
-        ? 'Supabase is still rejecting MP4 uploads. Run supabase-movie-upload-fix.sql in the Supabase SQL Editor for this project. Confirm its result lists video/mp4 in allowed_mime_types, then retry. Also check the project-wide upload limit.'
-        : message || 'Could not upload this movie.');
+      setMovieError(getMovieUploadErrorMessage(error));
     } finally {
       setMovieUploadProgress(null);
       if (movieInputRef.current) movieInputRef.current.value = '';

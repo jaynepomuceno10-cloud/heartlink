@@ -40,16 +40,15 @@ resumable transfers and support files up to 2 GB; either partner can delete a mo
 removes it for both devices.
 
 Run `supabase-sync.sql` and then `supabase-ldr-features.sql` in the Supabase SQL Editor to
-update the shared-data types and media bucket policies, including explicit MP4 (`video/mp4`)
-support. If an upload returns a MIME type 415 error, rerun both scripts in this order so
-the existing bucket's allowed MIME types are updated. In the Supabase project settings,
-also raise the global maximum upload size to 2 GB (subject to the project's plan limits).
-The SQL scripts set the bucket-level cap and allow video MIME types, but cannot override
-Supabase's project-wide upload limit. Both partners need a compatible browser video codec
-and an active connection; browser autoplay restrictions may require the receiving partner
-to tap Play once.
-Alternatively, run `supabase-movie-upload-fix.sql` by itself to update the bucket and return
-its active configuration. Confirm the result includes `video/mp4` before retrying the upload.
+update the shared-data types and media bucket policies. To avoid MIME-type mismatches between
+devices, the scripts leave the private bucket's MIME allowlist unset; couple-only storage
+policies still control access, and the Movies UI only accepts video files. If an upload
+returns a MIME type 415 error, run `supabase-movie-upload-fix.sql` by itself and confirm its
+result shows `allowed_mime_types` as `NULL`. In Supabase project settings, also raise the
+global maximum upload size to 2 GB (subject to the project's plan limits); SQL cannot
+override that project-wide limit. Both partners need a compatible browser video codec and
+an active connection; browser autoplay restrictions may require the receiving partner to
+tap Play once.
 
 Push notifications are sent through the Next.js API and require these environment variables
 in local development and Vercel Production:

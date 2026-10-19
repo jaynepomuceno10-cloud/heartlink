@@ -197,18 +197,17 @@ create policy "Couple members can delete app data"
   on public.couple_app_data for delete to authenticated
   using (public.is_heartlink_couple_member(couple_code));
 
-insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+insert into storage.buckets (id, name, public, file_size_limit)
 values (
   'heartlink-media',
   'heartlink-media',
   false,
-  2147483648,
-  array['image/*', 'audio/*', 'video/*', 'video/mp4']
+  2147483648
 )
 on conflict (id) do update
 set public = false,
     file_size_limit = excluded.file_size_limit,
-    allowed_mime_types = excluded.allowed_mime_types;
+    allowed_mime_types = null;
 
 drop policy if exists "Couple members can read Heartlink media" on storage.objects;
 create policy "Couple members can read Heartlink media"

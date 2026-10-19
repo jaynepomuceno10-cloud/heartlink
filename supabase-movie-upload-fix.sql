@@ -5,20 +5,18 @@ insert into storage.buckets (
   id,
   name,
   public,
-  file_size_limit,
-  allowed_mime_types
+  file_size_limit
 )
 values (
   'heartlink-media',
   'heartlink-media',
   false,
-  2147483648,
-  array['image/*', 'audio/*', 'video/*', 'video/mp4']
+  2147483648
 )
 on conflict (id) do update
 set public = false,
     file_size_limit = excluded.file_size_limit,
-    allowed_mime_types = excluded.allowed_mime_types;
+    allowed_mime_types = null;
 
 select id, public, file_size_limit, allowed_mime_types
 from storage.buckets
